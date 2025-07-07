@@ -658,7 +658,8 @@ def generate_netplan_yaml(interfaces):
         ethernet_config = {
             "dhcp4": False,  # Assuming static configuration for provided data
             "addresses": [],
-            "routes": []
+            "routes": [],
+            "nameservers": {}
         }
         mac_address = interface_config.get("mac")
         if mac_address:
@@ -680,6 +681,11 @@ def generate_netplan_yaml(interfaces):
         gateway = interface_config.get("gateway")
         if gateway:
             ethernet_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
+
+        # DNS
+        dns_servers = interface_config.get("dns")
+        if dns_servers:
+            ethernet_config["nameservers"]["addresses"] = dns_servers
 
         # Routes
         routes = interface_config.get("routes", [])
@@ -768,6 +774,11 @@ def generate_ifupdown_interfaces(interfaces):
         gateway = interface_config.get("gateway")
         if gateway:
             config_lines.append(f"    gateway {gateway}")
+
+        dns_servers = interface_config.get("dns")
+        if dns_servers:
+            nameservers = " ".join(dns_servers)
+            config_lines.append(f"dns-nameservers {nameservers}")
 
         # Static Routes
         routes = interface_config.get("routes", [])
@@ -1107,7 +1118,7 @@ def main():
             save_config_files("netplan", netplan_data, "/sysroot/etc/netplan")        
             print(f"Wrote netplan {netplan_data}")
     except Exception as exc:
-        print(f"Failed to generate netplan")
+        print(f"Failed to generate netplan {exc}")
         os.execv("/bin/bash", ["bash"])
 
     shutil.copyfile(path_join("/sysroot", BOOTSTRAPPED_MARKER), "/tmp/kexec.sh")
