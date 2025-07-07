@@ -58,3 +58,8 @@ mdadm
 sync
 dumpe2fs
 e2fsck
+useradd
+adduser
+groupadd
+groupdel
+userdel

@@ -1,15 +1,15 @@
 {
     "name": "testnode-1",
     "os_type": "dgx",
-    "kernel": "/sysroot/boot/vmlinuz-5.15.0-1063-nvidia",
-    "initrd": "/sysroot/boot/initrd.img-5.15.0-1063-nvidia",
+    "kernel": "/boot/vmlinuz-6.11.0-26-generic",
+    "initrd": "/boot/initrd.img-6.11.0-26-generic",
     "image": {
         "rsync_server": "192.168.122.1",
         "name": "default-image"
     },
     "kernel_arguments": "rw console=tty0 console=ttyS0,115200n8 rw crash=auto",
     "provisioning_status": "sync",
-    "config_timestamp": "1751853631",
+    "config_timestamp": "1751895778",
     "dns_servers": ["8.8.8.8", "8.8.4.4"],
     "ssh_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSjJRlKjFqsI2rvwALVeszFZodLSF8/m1Sg2iHRzZfIAFegQ0XAk9gpXJoiyK7BpJxB7ySGcwdLzDugbDl+RKcU9tO3PEIcyWoQ8S5nxnAWGZvsbqtKHCRrO27vNHrpbQdvDy2", 
     "interfaces": {
@@ -48,8 +48,10 @@
     },
     "users": {
         "operation": {
-            "password": "atomic",
-            "ssh-key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSjJRlKjFqsI2rvwALVeszFZodLSF8/m1Sg2iHRzZfIAFegQ0XAk9gpXJoiyK7BpJxB7ySGcwdLzDugbDl+RKcU9tO3PEIcyWoQ8S5nxnAWGZvsbqtKHCRrO27vNHrpbQdvDy2"
+            "password": "test@1234",
+            "shell": "/bin/bash",
+            "groups": ["sudo", "users"],
+            "ssh_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSjJRlKjFqsI2rvwALVeszFZodLSF8/m1Sg2iHRzZfIAFegQ0XAk9gpXJoiyK7BpJxB7ySGcwdLzDugbDl+RKcU9tO3PEIcyWoQ8S5nxnAWGZvsbqtKHCRrO27vNHrpbQdvDy2"
         }
     }
 }

@@ -827,9 +827,9 @@ def save_config_files(config_type, configs, output_dir):
     else:
         print(f"Unsupported config_type: {config_type}")
 
-def process_systemd_service():
+def run_command_in_image(cmds, script_temp_name="temp"):
     """
-    Fix systemd service in target
+    Run a command in chrooted in target.
     """
     try:
         chroot_script = """
@@ -838,25 +838,160 @@ mount --bind /dev  /sysroot/dev
 mount --bind /proc /sysroot/proc
 mount --bind /sys  /sysroot/sys
 """
-        for service in NodeConfig["systemd"]["enable"]:
-            chroot_script += f"chroot /bin/bash -c 'systemctl enable {service}' \n"
-
-        for service in NodeConfig["systemd"]["enable"]:
-            chroot_script += f"chroot /bin/bash -c 'systemctl disable {service}' \n"
+        for cmd in cmds:
+            if isinstance(cmd, str):
+                chroot_script += "chroot /sysroot <<EOF\n" + cmd + "\nEOF\n"
+            if isinstance(cmd, list):
+                chroot_script += "chroot /sysroot <<EOF\n" + " ".join(cmd)  + "\nEOF\n"
         
         chroot_script += """
 umount /sysroot/sys
 umount /sysroot/proc
 umount /sysroot/dev
 """
-        with open("/tmp/systemd_services.sh", "w") as outf:
+        print(f"DEBUG: generated script [{chroot_script}]")
+        script_name = f"/tmp/{script_temp_name}.sh"
+        with open(script_name, "w") as outf:
             outf.write(chroot_script)
 
-        os.chmod("/tmp/systemd_services.sh", 0o755)
-        run_command("/tmp/systemd_services.sh")
+        os.chmod(script_name, 0o755)
+        run_command(script_name)
     except subprocess.CalledProcessError as exc:
-        print(f"failed to setup systemd service in target {exc}")
+        print(f"failed to run {script_name} in target {exc}")
         os.execv("/bin/bash", ["bash"])
+
+def process_systemd_service():
+    """
+    Fix systemd service in target
+    """
+    cmds = []
+    for service in NodeConfig["systemd"]["enable"]:
+        cmds.append(f"chroot /bin/bash -c 'systemctl enable {service}' \n")
+    for service in NodeConfig["systemd"]["enable"]:
+        cmds.append(f"chroot /bin/bash -c 'systemctl disable {service}' \n")
+    run_command_in_image(cmds)    
+
+def create_or_update_users():
+    """
+    Create/Update user details in target
+    """
+    def _read_etc_shadow():
+        with open(path_join(SYSROOT, "/etc/shadow")) as inf:
+            return inf.read()
+        
+    def _append_to_file(name, data):
+        with open(path_join(SYSROOT, name), "+a") as outf:
+            outf.write(data)
+
+    cmds = []
+    try:
+        for user, detail in NodeConfig["users"].items():
+            if user in _read_etc_shadow():
+                # user exists, update
+                if "ssh_key" in detail:
+                    # Ensure .ssh directory exists and has correct permissions
+                    cmds.append(["mkdir", "-p", path_join(f"/home/{user}", ".ssh")])
+                    cmds.append(["chmod", "700", path_join(f"/home/{user}", ".ssh")])
+                    cmds.append(["chown", user, path_join(f"/home/{user}", ".ssh")])
+                    
+                    # Append the new SSH key if it's not already there
+                    # This is tricky: we want to append *only if* the key isn't present.
+                    # For simplicity, we'll just append it. A more robust solution
+                    # would check for its existence first using `grep` or reading the file.
+                    # Or overwrite if that's the desired behavior for updates.
+                    # For now, let's just append for simplicity.
+                    # Note: _append_to_file needs to run as root or the user.
+                    # Let's generate a command for run_command_in_image for this.
+                    authorized_keys_path = path_join(f"/home/{user}", ".ssh", "authorized_keys")
+                    # Using `echo` with redirection. Be careful with shell injection if `detail["ssh_key"]` comes from untrusted sources.
+                    # A safer way might be to use a temporary file or a tool designed for this.
+                    # For demonstration, a simple echo:
+                    cmds.append([f"echo '{detail['ssh_key']}' >> {authorized_keys_path}"])
+                    cmds.append(["chmod", "600", authorized_keys_path])
+                    cmds.append(["chown", user, authorized_keys_path])
+                    print(f"  SSH key for '{user}' updated/appended.")
+                
+                if "password" in detail:
+                    # Using 'echo user:password | chpasswd' is the standard way.
+                    # Note: This sends the password via stdin, which is better than command line args.
+                    # If NodeConfig stores plain passwords, this is where you'd hash them before passing to chpasswd.
+                    # `chpasswd` expects `user:password` on stdin.
+                    cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
+                    print(f"  Password for '{user}' updated.")
+                
+                # Update groups
+                if "groups" in detail and isinstance(detail["groups"], list):
+                    # usermod -aG group1,group2 user
+                    # -a is append, -G is groups
+                    groups_str = ",".join(detail["groups"])
+                    cmds.append(["usermod", "-aG", groups_str, user])
+                    print(f"  Groups for '{user}' updated: {groups_str}")
+                
+                # Update shell
+                if "shell" in detail:
+                    cmds.append(["usermod", "-s", detail["shell"], user])
+                    print(f"  Shell for '{user}' updated to {detail['shell']}.")
+
+            else:
+                print(f"User '{user}' does not exist. Creating new user.")
+                # Create new user
+                # useradd -m: create home directory
+                # useradd -s: set shell
+                useradd_cmd = ["useradd", "-m"]
+                if "shell" in detail:
+                    useradd_cmd.extend(["-s", detail["shell"]])
+                
+                # Add to groups during creation if primary group is not user's own
+                # If "groups" includes a primary group, you might use -g, otherwise -G for supplementary.
+                # For simplicity, we'll use usermod -aG later for supplementary groups.
+                # Or, if the first group in 'groups' is meant to be primary:
+                # if "groups" in detail and detail["groups"]:
+                #     useradd_cmd.extend(["-g", detail["groups"][0]])
+                
+                useradd_cmd.append(user)
+                cmds.append(useradd_cmd)
+
+                # Set password for new user
+                if "password" in detail:
+                    # Use chpasswd immediately after user creation
+                    cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
+                    print(f"  Password set for '{user}'.")
+
+                # Add SSH key
+                if "ssh_key" in detail:
+                    cmds.append(["mkdir", "-p", path_join(f"/home/{user}", ".ssh")])
+                    cmds.append(["chmod", "700", path_join(f"/home/{user}", ".ssh")])
+                    cmds.append(["chown", user, path_join(f"/home/{user}", ".ssh")])
+                    authorized_keys_path = path_join(f"/home/{user}", ".ssh/authorized_keys")
+                    cmds.append([f"echo '{detail['ssh_key']}' > {authorized_keys_path}"]) # Use > for new user
+                    cmds.append(["chmod", "600", authorized_keys_path])
+                    cmds.append(["chown", user, authorized_keys_path])
+                    print(f"  SSH key added for '{user}'.")
+                
+                # Add to supplementary groups (if any, beyond what useradd handled)
+                if "groups" in detail and isinstance(detail["groups"], list):
+                    # If useradd created a primary group, handle supplementary groups here.
+                    # Or, if you want all groups to be supplementary, do it all here.
+                    groups_str = ",".join(detail["groups"])
+                    cmds.append(["usermod", "-aG", groups_str, user])
+                    print(f"  Groups assigned for '{user}': {groups_str}")
+
+    except Exception as exc:
+        print(f"failure in processing user section {exc}")
+        os.execv("/bin/bash", ["bash"])
+
+    run_command_in_image(cmds)    
+
+def path_join(src, dst):
+    def _helper(path_string):
+        # Check if the string is not empty and starts with a slash
+        if path_string and path_string.startswith('/'):
+            # Return the substring starting from the second character
+            return path_string[1:]
+        else:
+            # No leading slash, or string is empty, return as is
+            return path_string
+    return os.path.join(src, _helper(dst))
 
 # --- Main Script Execution Flow ---
 def main():
@@ -907,21 +1042,26 @@ def main():
 
     rsync_server = NodeConfig["image"]["rsync_server"]
     image_name = NodeConfig["image"]["name"]
+    rsync_url = f"rsync://{rsync_server}/images/{image_name}/*"
 
     # If rootfs was not copied properly
-    if not os.path.exists(os.path.join("/sysroot/", FS_INSTALLED_MARKER)):
-        if not transfer_rootfs(source=f"rsync://{rsync_server}/images/{image_name}"):
+    if not os.path.exists(path_join("/sysroot/", FS_INSTALLED_MARKER)):
+        if not transfer_rootfs(source=rsync_url):
             os.execv("/bin/bash", ["bash"])
     
     if NodeConfig["provisioning_status"] == "sync":
-        transfer_rootfs(source=f"rsync://{rsync_server}/images/{image_name}")
+        transfer_rootfs(source=rsync_url)
     
-    if not os.path.exists(os.path.join("/sysroot/", BOOTSTRAPPED_MARKER)):
+    print("Copying kernel and initrd to tmp...")
+    shutil.copyfile(path_join("/sysroot", NodeConfig["kernel"]), "/tmp/vmlinuz")
+    shutil.copyfile(path_join("/sysroot", NodeConfig["initrd"]), "/tmp/initrd.img")
+
+    if not os.path.exists(path_join("/sysroot/", BOOTSTRAPPED_MARKER)):
         # Create boostrapped file
         generate_bootstrapped_file()
     
     compare_ret = compare_file_mtime_with_unix_timestamp(
-        os.path.join("/sysroot/", BOOTSTRAPPED_MARKER), 
+        path_join("/sysroot/", BOOTSTRAPPED_MARKER), 
         NodeConfig["config_timestamp"])
     if compare_ret == -2:
         print("failed to compare config timestamp")
@@ -931,19 +1071,19 @@ def main():
         generate_bootstrapped_file()
 
     try:
-        filename = os.path.join("/sysroot", "etc/hostname")
+        filename = path_join("/sysroot", "/etc/hostname")
         print(f"Updating {filename}")
         with open(filename, "w") as outf:
             outf.write(NodeConfig["name"])
 
-        filename = os.path.join("/sysroot", "etc/resolv.conf")
-        print(f"Updating {filename}")
-        with open(filename, "w") as outf:
-            for ds in NodeConfig["dns_servers"]:
-                outf.write(f"nameserver {ds}\n")
+        # filename = os.path.join("/sysroot", "etc/resolv.conf")
+        # print(f"Updating {filename}")
+        # with open(filename, "w") as outf:
+        #     for ds in NodeConfig["dns_servers"]:
+        #         outf.write(f"nameserver {ds}\n")
 
         os.makedirs("/sysroot/root/.ssh/", exist_ok=True)
-        filename = os.path.join("/sysroot", "root/.ssh/authorized_keys")
+        filename = path_join("/sysroot", "/root/.ssh/authorized_keys")
         print(f"Updating {filename}")
         with open(filename, "w") as outf:
             ssh_key = NodeConfig["ssh_key"]
@@ -970,13 +1110,11 @@ def main():
         print(f"Failed to generate netplan")
         os.execv("/bin/bash", ["bash"])
 
-    print("Copying kernel and initrd to tmp...")
-    shutil.copyfile(os.path.join("/sysroot", NodeConfig["kernel"]), "/tmp/vmlinuz")
-    shutil.copyfile(os.path.join("/sysroot", NodeConfig["initrd"]), "/tmp/initrd.img")
-    shutil.copyfile(os.path.join("/sysroot", BOOTSTRAPPED_MARKER), "/tmp/kexec.sh")
+    shutil.copyfile(path_join("/sysroot", BOOTSTRAPPED_MARKER), "/tmp/kexec.sh")
     os.chmod("/tmp/kexec.sh", 0o700)
     
     process_systemd_service()
+    create_or_update_users()
 
     # Flush the changes
     try:
