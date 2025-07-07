@@ -1,0 +1,9 @@
+ubuntu:
+kexec-tools
+net-tools
+isc-dhcp-client
+mdadm
+
+python:
+mdstat
+psutil

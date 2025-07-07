@@ -1,0 +1,15 @@
+lost+found/
+/proc/*
+/sys/*
+/boot/efi
+/etc/machine-id
+/cm/*
+/tmp/*
+/var/run/*
+/run/*
+/var/cache/apt/*
+/usr/share/man/*
+/usr/share/man-db/*
+/data-disk/*
+/home/sadas/*
+images/default-image

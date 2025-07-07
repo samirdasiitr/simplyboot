@@ -1,0 +1,10 @@
+initrd.img
+initrd_build/
+node_config_server/node_db/
+rsync_server/images/
+rsync_server/rsyncd.lock
+rsync_server/rsyncd.log
+rsync_server/rsyncd.pid
+testdisk-vdb.qcow2
+testdisk.qcow2
+tools/
