@@ -9,6 +9,7 @@ import psutil
 import requests
 import datetime
 import yaml
+from ipaddress import IPv4Network, IPv4Interface
 
 # --- Global Variables and Configuration ---
 # Extend the PATH for commonly used binaries within the initramfs environment.
@@ -594,9 +595,6 @@ def read_proc_cmdline():
     print(config)
     return config
 
-import os
-import datetime
-
 def compare_file_mtime_with_unix_timestamp(file_path, unix_timestamp_str):
     """
     Compares a file's modified timestamp with a given Unix timestamp string.
@@ -635,6 +633,13 @@ def compare_file_mtime_with_unix_timestamp(file_path, unix_timestamp_str):
     except Exception as e:
         return -2
     
+def netmask_to_cidr(netmask):
+    """Converts a subnet mask (e.g., "255.255.255.0") to CIDR notation (e.g., 24)."""
+    try:
+        return sum(bin(int(x)).count('1') for x in netmask.split('.'))
+    except ValueError:
+        return None
+
 def generate_netplan_yaml(interfaces):
     """
     Generates a Netplan YAML configuration from a given JSON input.
@@ -650,60 +655,142 @@ def generate_netplan_yaml(interfaces):
         "network": {
             "version": 2,
             "renderer": "networkd",
-            "ethernets": {}
         }
     }
+    
+    ethernets_config = {}
+    vlans_config = {}
+    bridges_config = {}
+    vxlans_config = {}
+    bonds_config = {}
 
     for interface_name, interface_config in interfaces.items():
-        ethernet_config = {
-            "dhcp4": False,  # Assuming static configuration for provided data
-            "addresses": [],
-            "routes": [],
-            "nameservers": {}
-        }
-        mac_address = interface_config.get("mac")
-        if mac_address:
-            ethernet_config["macaddress"] = mac_address
+        if interface_config["type"] == "physical":
+            ethernet_config = {
+                "dhcp4": False,
+                "addresses": [],
+                "routes": [],
+                "nameservers": {}
+            }
+            mac_address = interface_config.get("mac")
+            if mac_address:
+                ethernet_config["macaddress"] = mac_address
 
-        # IP address and netmask
-        ipv4_address = interface_config.get("ipv4")
-        netmask = interface_config.get("netmask")
-        if ipv4_address and netmask:
-            # Convert netmask to CIDR prefix
-            from ipaddress import IPv4Interface
-            try:
-                ip_interface = IPv4Interface((ipv4_address, netmask))
-                ethernet_config["addresses"].append(str(ip_interface))
-            except Exception as e:
-                print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
+                try:
+                    ip_interface = IPv4Interface(f"{ipv4_address}/{netmask_to_cidr(netmask)}")
+                    ethernet_config["addresses"].append(str(ip_interface))
+                except Exception as e:
+                    print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
 
-        # Gateway
-        gateway = interface_config.get("gateway")
-        if gateway:
-            ethernet_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
+            gateway = interface_config.get("gateway")
+            if gateway:
+                ethernet_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
 
-        # DNS
-        dns_servers = interface_config.get("dns")
-        if dns_servers:
-            ethernet_config["nameservers"]["addresses"] = dns_servers
+            routes = interface_config.get("routes", [])
+            for route in routes:
+                to = route.get("ip_or_range")
+                is_default = route.get("default", False)
 
-        # Routes
-        routes = interface_config.get("routes", [])
-        for route in routes:
-            to = route.get("ip_or_range")
-            is_default = route.get("default", False)
-
-            if to:
-                if is_default:
-                    # Default route is already handled by 'gateway'
-                    continue
-                else:
+                if to and not is_default:
                     route_entry = {"to": to}
                     ethernet_config["routes"].append(route_entry)
+            
+            dns_servers = interface_config.get("dns", [])
+            if dns_servers:
+                ethernet_config["nameservers"]["addresses"] = dns_servers
 
-        netplan_config["network"]["ethernets"][interface_name] = ethernet_config
+            ethernets_config[interface_name] = ethernet_config
 
-    # Use a custom representer to prevent aliases for repeated data (e.g., gateway)
+        elif interface_config["type"] == "vlan":
+            vlan_config = {
+                "id": int(interface_name.split('.')[-1]), # Assuming VLAN ID is after last dot
+                "link": interface_config["parent"]
+            }
+            vlans_config[interface_name] = vlan_config
+
+        elif interface_config["type"] == "bridge":
+            bridge_config = {
+                "interfaces": [interface_config["upstream"]],
+                "macaddress": interface_config.get("mac")
+            }
+            # TODO: add ipv4 details
+            bridges_config[interface_name] = bridge_config
+        
+        elif interface_config["type"] == "vxlan":
+            vxlan_config = {
+                "id": interface_config["id"],
+                "local": interface_config["local"],
+                "mac-learning": interface_config["mac_learning"],
+                "port": interface_config["port"],
+                "mode": "vxlan"
+            }
+            vxlans_config[interface_name] = vxlan_config
+
+        elif interface_config["type"] == "bond":
+            for slave in interface_config.get("bond_slaves", []):
+                ethernets_config[slave] = {
+                    "dhcp4": "no"
+                }
+            bond_config = {
+                "interfaces": interface_config.get("bond_slaves", []),
+                "parameters": {
+                    "mode": interface_config.get("bond_mode"),
+                    "primary": interface_config.get("bond_primary"),
+                    "mii-monitor-interval": interface_config.get("bond_miimon"),
+                    "down-delay": interface_config.get("bond_downdelay"),
+                    "up-delay": interface_config.get("bond_updelay"),
+                    "lacp-rate": interface_config.get("bond_lacp_rate")
+                },
+                "addresses": [],
+                "routes": [],
+                "nameservers": {}
+            }
+            mac_address = interface_config.get("mac")
+            if mac_address:
+                bond_config["macaddress"] = mac_address
+
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
+                try:
+                    ip_interface = IPv4Interface(f"{ipv4_address}/{netmask_to_cidr(netmask)}")
+                    bond_config["addresses"].append(str(ip_interface))
+                except Exception as e:
+                    print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
+
+            gateway = interface_config.get("gateway")
+            if gateway:
+                bond_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
+
+            routes = interface_config.get("routes", [])
+            for route in routes:
+                to = route.get("ip_or_range")
+                is_default = route.get("default", False)
+
+                if to and not is_default:
+                    route_entry = {"to": to}
+                    bond_config["routes"].append(route_entry)
+
+            dns_servers = interface_config.get("dns", [])
+            if dns_servers:
+                bond_config["nameservers"]["addresses"] = dns_servers
+
+            bonds_config[interface_name] = bond_config
+
+    if ethernets_config:
+        netplan_config["network"]["ethernets"] = ethernets_config
+    if vlans_config:
+        netplan_config["network"]["vlans"] = vlans_config
+    if bridges_config:
+        netplan_config["network"]["bridges"] = bridges_config
+    if vxlans_config:
+        netplan_config["network"]["tunnels"] = vxlans_config
+    if bonds_config:
+        netplan_config["network"]["bonds"] = bonds_config
+
     class NoAliasDumper(yaml.Dumper):
         def ignore_aliases(self, data):
             return True
@@ -746,56 +833,134 @@ def generate_ifupdown_interfaces(interfaces):
     ifupdown_configs = {}
 
     for interface_name, interface_config in interfaces.items():
+        # ifupdown is less suited for complex setups like VXLANs and advanced bonds
+        # and would typically require separate configuration files or scripts.
+        # This implementation will focus on physical interfaces and simple bonds/bridges
+        # if they can be expressed simply. For full support of the provided JSON,
+        # Netplan is a better fit.
+
         config_lines = [
             f"auto {interface_name}",
-            f"iface {interface_name} inet static"
         ]
 
-        # MAC Address
-        mac_address = interface_config.get("macaddress")
-        if mac_address:
-            config_lines.append(f"    hwaddress ether {mac_address}")
+        if interface_config["type"] == "physical":
+            config_lines.append(f"iface {interface_name} inet static")
 
-        # IP address and netmask
-        ipv4_address = interface_config.get("ipv4")
-        netmask = interface_config.get("netmask")
-        if ipv4_address and netmask:
-            try:
-                from ipaddress import IPv4Interface
-                # Use IPv4Interface to ensure valid IP and derive netmask (though we have it)
-                # It's more for validation here, the values are used directly.
-                IPv4Interface((ipv4_address, netmask)) # Just to validate format
+            # MAC Address
+            mac_address = interface_config.get("mac")
+            if mac_address:
+                config_lines.append(f"    hwaddress ether {mac_address}")
+
+            # IP address and netmask
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
+                try:
+                    # Use IPv4Interface to ensure valid IP and derive netmask (though we have it)
+                    IPv4Interface((ipv4_address, netmask)) # Just to validate format
+                    config_lines.append(f"    address {ipv4_address}")
+                    config_lines.append(f"    netmask {netmask}")
+                except Exception as e:
+                    print(f"Warning (ifupdown): Could not parse IP address or netmask for {interface_name}: {e}")
+
+            # Gateway
+            gateway = interface_config.get("gateway")
+            if gateway:
+                config_lines.append(f"    gateway {gateway}")
+
+            # DNS (typically in /etc/resolv.conf, not directly in interfaces file for ifupdown)
+            # You might need to integrate with a resolvconf package or manage /etc/resolv.conf separately.
+            # For simplicity, we'll note it here but not add to interfaces.d directly.
+            dns_servers = interface_config.get("dns", [])
+            if dns_servers:
+                print(f"Note: DNS servers {dns_servers} for {interface_name} would typically go in /etc/resolv.conf with ifupdown setup.")
+
+            # Static Routes
+            routes = interface_config.get("routes", [])
+            for route in routes:
+                to = route.get("ip_or_range")
+                is_default = route.get("default", False)
+
+                if to and not is_default:
+                    config_lines.append(f"    post-up ip route add {to} dev {interface_name}")
+
+        elif interface_config["type"] == "vlan":
+            # For VLANs, ifupdown uses 'vlan-raw-device'
+            parent_interface = interface_config.get("parent")
+            vlan_id = int(interface_name.split('.')[-1])
+            config_lines.append(f"iface {interface_name} inet manual")
+            config_lines.append(f"    vlan-raw-device {parent_interface}")
+            # IPv4 details for VLANs if they have them
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
                 config_lines.append(f"    address {ipv4_address}")
                 config_lines.append(f"    netmask {netmask}")
-            except Exception as e:
-                print(f"Warning (ifupdown): Could not parse IP address or netmask for {interface_name}: {e}")
+            gateway = interface_config.get("gateway")
+            if gateway:
+                config_lines.append(f"    gateway {gateway}")
 
-        # Gateway
-        gateway = interface_config.get("gateway")
-        if gateway:
-            config_lines.append(f"    gateway {gateway}")
+        elif interface_config["type"] == "bond":
+            bond_slaves = " ".join(interface_config.get("bond_slaves", []))
+            bond_mode = interface_config.get("bond_mode")
+            bond_primary = interface_config.get("bond_primary")
+            bond_miimon = interface_config.get("bond_miimon")
+            bond_downdelay = interface_config.get("bond_downdelay")
+            bond_updelay = interface_config.get("bond_updelay")
 
-        dns_servers = interface_config.get("dns")
-        if dns_servers:
-            nameservers = " ".join(dns_servers)
-            config_lines.append(f"dns-nameservers {nameservers}")
+            config_lines.append(f"iface {interface_name} inet static")
+            config_lines.append(f"    bond-slaves {bond_slaves}")
+            config_lines.append(f"    bond-mode {bond_mode}")
+            if bond_primary:
+                config_lines.append(f"    bond-primary {bond_primary}")
+            if bond_miimon:
+                config_lines.append(f"    bond-miimon {bond_miimon}")
+            if bond_downdelay:
+                config_lines.append(f"    bond-downdelay {bond_downdelay}")
+            if bond_updelay:
+                config_lines.append(f"    bond-updelay {bond_updelay}")
 
-        # Static Routes
-        routes = interface_config.get("routes", [])
-        for route in routes:
-            to = route.get("ip_or_range")
-            is_default = route.get("default", False)
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
+                config_lines.append(f"    address {ipv4_address}")
+                config_lines.append(f"    netmask {netmask}")
+            gateway = interface_config.get("gateway")
+            if gateway:
+                config_lines.append(f"    gateway {gateway}")
+            
+            # DNS for bonds
+            dns_servers = interface_config.get("dns", [])
+            if dns_servers:
+                print(f"Note: DNS servers {dns_servers} for {interface_name} (bond) would typically go in /etc/resolv.conf with ifupdown setup.")
 
-            if to:
-                if not is_default:
-                    # ifupdown uses 'post-up' for static routes
-                    # Ensure route destination is valid
-                    try:
-                        # Validate the route destination (e.g., "192.168.0.0/24")
-                        config_lines.append(f"    post-up ip route add {to} dev {interface_name}")
-                    except Exception as e:
-                        print(f"Warning (ifupdown): Could not parse route destination '{to}' for {interface_name}: {e}")
+            routes = interface_config.get("routes", [])
+            for route in routes:
+                to = route.get("ip_or_range")
+                is_default = route.get("default", False)
+                if to and not is_default:
+                    config_lines.append(f"    post-up ip route add {to} dev {interface_name}")
 
+        elif interface_config["type"] == "bridge":
+            # For bridges, ifupdown uses 'bridge_ports'
+            upstream_interface = interface_config.get("upstream")
+            config_lines.append(f"iface {interface_name} inet static")
+            config_lines.append(f"    bridge_ports {upstream_interface}")
+            # If the bridge itself has an IP
+            ipv4_address = interface_config.get("ipv4")
+            netmask = interface_config.get("netmask")
+            if ipv4_address and netmask:
+                config_lines.append(f"    address {ipv4_address}")
+                config_lines.append(f"    netmask {netmask}")
+            gateway = interface_config.get("gateway")
+            if gateway:
+                config_lines.append(f"    gateway {gateway}")
+
+        elif interface_config["type"] == "vxlan":
+            # ifupdown doesn't have native VXLAN support. This would typically require
+            # pre-up/post-up scripts to create the VXLAN device using 'ip link add vxlan...'
+            print(f"Warning: VXLAN interface '{interface_name}' requires manual pre-up/post-up scripts for ifupdown.")
+            continue # Skip generating config for VXLAN in ifupdown directly
 
         ifupdown_configs[interface_name] = "\n".join(config_lines) + "\n"
 
@@ -876,64 +1041,42 @@ def process_systemd_service():
     Fix systemd service in target
     """
     cmds = []
-    for service in NodeConfig["systemd"]["enable"]:
-        cmds.append(f"chroot /bin/bash -c 'systemctl enable {service}' \n")
-    for service in NodeConfig["systemd"]["enable"]:
-        cmds.append(f"chroot /bin/bash -c 'systemctl disable {service}' \n")
-    run_command_in_image(cmds)    
+    if "systemd" in NodeConfig:
+        if "enable" in NodeConfig["systemd"]:
+            for service in NodeConfig["systemd"]["enable"]:
+                cmds.append(f"systemctl enable {service}")
+        if "disable" in NodeConfig["systemd"]:
+            for service in NodeConfig["systemd"]["disable"]:
+                cmds.append(f"systemctl disable {service}")
+    
+    if cmds: # Only run if there are commands to execute
+        run_command_in_image(cmds)    
 
 def create_or_update_users():
     """
     Create/Update user details in target
     """
     def _read_etc_shadow():
-        with open(path_join(SYSROOT, "/etc/shadow")) as inf:
-            return inf.read()
+        try:
+            with open(path_join(SYSROOT, "etc/shadow")) as inf:
+                return inf.read()
+        except FileNotFoundError:
+            print("Warning: /etc/shadow not found. Cannot check for existing users.", file=os.sys.stderr)
+            return "" # Return empty string if file doesn't exist to avoid crash
         
-    def _append_to_file(name, data):
-        with open(path_join(SYSROOT, name), "+a") as outf:
-            outf.write(data)
-
     cmds = []
     try:
+        if "users" not in NodeConfig or not NodeConfig["users"]:
+            print("No user configurations found in NodeConfig.")
+            return
+
         for user, detail in NodeConfig["users"].items():
-            if user in _read_etc_shadow():
-                # user exists, update
-                if "ssh_key" in detail:
-                    # Ensure .ssh directory exists and has correct permissions
-                    cmds.append(["mkdir", "-p", path_join(f"/home/{user}", ".ssh")])
-                    cmds.append(["chmod", "700", path_join(f"/home/{user}", ".ssh")])
-                    cmds.append(["chown", user, path_join(f"/home/{user}", ".ssh")])
-                    
-                    # Append the new SSH key if it's not already there
-                    # This is tricky: we want to append *only if* the key isn't present.
-                    # For simplicity, we'll just append it. A more robust solution
-                    # would check for its existence first using `grep` or reading the file.
-                    # Or overwrite if that's the desired behavior for updates.
-                    # For now, let's just append for simplicity.
-                    # Note: _append_to_file needs to run as root or the user.
-                    # Let's generate a command for run_command_in_image for this.
-                    authorized_keys_path = path_join(f"/home/{user}", ".ssh", "authorized_keys")
-                    # Using `echo` with redirection. Be careful with shell injection if `detail["ssh_key"]` comes from untrusted sources.
-                    # A safer way might be to use a temporary file or a tool designed for this.
-                    # For demonstration, a simple echo:
-                    cmds.append([f"echo '{detail['ssh_key']}' >> {authorized_keys_path}"])
-                    cmds.append(["chmod", "600", authorized_keys_path])
-                    cmds.append(["chown", user, authorized_keys_path])
-                    print(f"  SSH key for '{user}' updated/appended.")
-                
-                if "password" in detail:
-                    # Using 'echo user:password | chpasswd' is the standard way.
-                    # Note: This sends the password via stdin, which is better than command line args.
-                    # If NodeConfig stores plain passwords, this is where you'd hash them before passing to chpasswd.
-                    # `chpasswd` expects `user:password` on stdin.
-                    cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
-                    print(f"  Password for '{user}' updated.")
-                
+            user_exists = user in _read_etc_shadow()
+
+            if user_exists:
+                print(f"User '{user}' already exists. Updating user.")
                 # Update groups
                 if "groups" in detail and isinstance(detail["groups"], list):
-                    # usermod -aG group1,group2 user
-                    # -a is append, -G is groups
                     groups_str = ",".join(detail["groups"])
                     cmds.append(["usermod", "-aG", groups_str, user])
                     print(f"  Groups for '{user}' updated: {groups_str}")
@@ -942,56 +1085,54 @@ def create_or_update_users():
                 if "shell" in detail:
                     cmds.append(["usermod", "-s", detail["shell"], user])
                     print(f"  Shell for '{user}' updated to {detail['shell']}.")
+                
+                if "password" in detail:
+                    cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
+                    print(f"  Password for '{user}' updated.")
 
             else:
                 print(f"User '{user}' does not exist. Creating new user.")
-                # Create new user
-                # useradd -m: create home directory
-                # useradd -s: set shell
                 useradd_cmd = ["useradd", "-m"]
                 if "shell" in detail:
                     useradd_cmd.extend(["-s", detail["shell"]])
-                
-                # Add to groups during creation if primary group is not user's own
-                # If "groups" includes a primary group, you might use -g, otherwise -G for supplementary.
-                # For simplicity, we'll use usermod -aG later for supplementary groups.
-                # Or, if the first group in 'groups' is meant to be primary:
-                # if "groups" in detail and detail["groups"]:
-                #     useradd_cmd.extend(["-g", detail["groups"][0]])
-                
                 useradd_cmd.append(user)
                 cmds.append(useradd_cmd)
 
-                # Set password for new user
                 if "password" in detail:
-                    # Use chpasswd immediately after user creation
                     cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
                     print(f"  Password set for '{user}'.")
 
-                # Add SSH key
-                if "ssh_key" in detail:
-                    cmds.append(["mkdir", "-p", path_join(f"/home/{user}", ".ssh")])
-                    cmds.append(["chmod", "700", path_join(f"/home/{user}", ".ssh")])
-                    cmds.append(["chown", user, path_join(f"/home/{user}", ".ssh")])
-                    authorized_keys_path = path_join(f"/home/{user}", ".ssh/authorized_keys")
-                    cmds.append([f"echo '{detail['ssh_key']}' > {authorized_keys_path}"]) # Use > for new user
-                    cmds.append(["chmod", "600", authorized_keys_path])
-                    cmds.append(["chown", user, authorized_keys_path])
-                    print(f"  SSH key added for '{user}'.")
-                
-                # Add to supplementary groups (if any, beyond what useradd handled)
                 if "groups" in detail and isinstance(detail["groups"], list):
-                    # If useradd created a primary group, handle supplementary groups here.
-                    # Or, if you want all groups to be supplementary, do it all here.
                     groups_str = ",".join(detail["groups"])
                     cmds.append(["usermod", "-aG", groups_str, user])
                     print(f"  Groups assigned for '{user}': {groups_str}")
+            
+            # Handle SSH key for both new and existing users
+            if "ssh_key" in detail:
+                # Ensure .ssh directory exists and has correct permissions within the chroot
+                ssh_dir_path = path_join(f"/home/{user}", ".ssh")
+                authorized_keys_path = path_join(f"/home/{user}", ".ssh/authorized_keys")
+                
+                # These commands need to be run inside the chroot
+                cmds.append(["mkdir", "-p", ssh_dir_path])
+                cmds.append(["chmod", "700", ssh_dir_path])
+                cmds.append(["chown", user, ssh_dir_path])
+                
+                # Append the new SSH key. It's safer to always append and let SSH handle duplicates,
+                # or add logic to check for existence before appending if strict uniqueness is needed.
+                # Using 'tee -a' is safer than 'echo >>' for multi-line inputs and permissions.
+                cmds.append([f"echo '{detail['ssh_key']}' | tee -a {authorized_keys_path}"])
+                cmds.append(["chmod", "600", authorized_keys_path])
+                cmds.append(["chown", user, authorized_keys_path])
+                print(f"  SSH key for '{user}' added/appended.")
+
 
     except Exception as exc:
         print(f"failure in processing user section {exc}")
         os.execv("/bin/bash", ["bash"])
 
-    run_command_in_image(cmds)    
+    if cmds:
+        run_command_in_image(cmds)    
 
 def path_join(src, dst):
     def _helper(path_string):
@@ -1087,18 +1228,24 @@ def main():
         with open(filename, "w") as outf:
             outf.write(NodeConfig["name"])
 
-        # filename = os.path.join("/sysroot", "etc/resolv.conf")
-        # print(f"Updating {filename}")
-        # with open(filename, "w") as outf:
-        #     for ds in NodeConfig["dns_servers"]:
-        #         outf.write(f"nameserver {ds}\n")
+        # # Update /etc/resolv.conf based on NodeConfig DNS servers if available
+        # if "dns_servers" in NodeConfig and NodeConfig["dns_servers"]:
+        #     resolv_conf_path = path_join("/sysroot", "etc/resolv.conf")
+        #     print(f"Updating {resolv_conf_path}")
+        #     with open(resolv_conf_path, "w") as outf:
+        #         for ds in NodeConfig["dns_servers"]:
+        #             outf.write(f"nameserver {ds}\n")
 
-        os.makedirs("/sysroot/root/.ssh/", exist_ok=True)
-        filename = path_join("/sysroot", "/root/.ssh/authorized_keys")
+        # Root SSH key management
+        os.makedirs(path_join("/sysroot", "root/.ssh/"), exist_ok=True)
+        filename = path_join("/sysroot", "root/.ssh/authorized_keys")
         print(f"Updating {filename}")
-        with open(filename, "w") as outf:
-            ssh_key = NodeConfig["ssh_key"]
-            outf.write(f"nameserver {ssh_key}\n")
+        with open(filename, "w") as outf: # Overwrite for root's authorized_keys
+            ssh_key = NodeConfig.get("ssh_key", "") # Use .get with default empty string
+            if ssh_key:
+                outf.write(f"{ssh_key}\n")
+            else:
+                print("Warning: No SSH key found for root in NodeConfig.", file=os.sys.stderr)
 
         os.chmod(filename, 0o600)
     except Exception as exc:
@@ -1108,17 +1255,17 @@ def main():
     try:
         remove_netplan_files()
 
-        # Generate netplan
-        if NodeConfig["os_type"] == "dgx":
+        # Generate netplan or ifupdown based on os_type
+        if NodeConfig.get("os_type") == "dgx": # Using .get for robustness
             ifdata = generate_ifupdown_interfaces(NodeConfig["interfaces"])
-            save_config_files("ifupdown", ifdata, "/sysroot/etc/network/interfaces.d")
-            print(f"Wrote ifupdown {ifdata}")
+            save_config_files("ifupdown", ifdata, path_join(SYSROOT, "etc/network/interfaces.d"))
+            print(f"Wrote ifupdown configurations.")
         else:
             netplan_data = generate_netplan_yaml(NodeConfig["interfaces"])
-            save_config_files("netplan", netplan_data, "/sysroot/etc/netplan")        
-            print(f"Wrote netplan {netplan_data}")
+            save_config_files("netplan", netplan_data, path_join(SYSROOT, "etc/netplan"))        
+            print(f"Wrote netplan configuration.")
     except Exception as exc:
-        print(f"Failed to generate netplan {exc}")
+        print(f"Failed to generate netplan/ifupdown configuration: {exc}")
         os.execv("/bin/bash", ["bash"])
 
     shutil.copyfile(path_join("/sysroot", BOOTSTRAPPED_MARKER), "/tmp/kexec.sh")
@@ -1146,4 +1293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    os.execv("/bin/bash", ["bash"])
+    os.execv("/bin/bash", ["bash"]) # Ensure dropping to shell if main fails

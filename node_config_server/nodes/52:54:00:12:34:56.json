@@ -13,25 +13,29 @@
     "dns_servers": ["8.8.8.8", "8.8.4.4"],
     "ssh_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSjJRlKjFqsI2rvwALVeszFZodLSF8/m1Sg2iHRzZfIAFegQ0XAk9gpXJoiyK7BpJxB7ySGcwdLzDugbDl+RKcU9tO3PEIcyWoQ8S5nxnAWGZvsbqtKHCRrO27vNHrpbQdvDy2", 
     "interfaces": {
-        "ens3": {
+        "ens5": {
             "type": "physical",
-            "ipv4": "10.0.2.15",
+            "ipv4": "10.0.2.17",
+            "netmask": "255.255.255.0",
+            "mac": "52:54:00:12:34:58"
+        },
+        "ens6": {
+            "type": "physical",
+            "ipv4": "10.0.2.18",
+            "netmask": "255.255.255.0",
+            "mac": "52:54:00:12:34:59"
+        },
+        "bond0.100": {
+            "type": "vlan",
+            "parent": "bond0"
+        },
+        "br0": {
+            "type": "bridge",
+            "upstream": "bond0",
+            "mac": "52:54:00:12:34:57",
+            "ipv4": "10.0.2.17",
             "netmask": "255.255.255.0",
             "gateway": "10.0.2.2",
-            "mac": "52:54:00:12:34:56",
-            "dns": ["8.8.8.8", "8.8.4.4"],
-            "routes": [
-                {
-                    "default": false,
-                    "ip_or_range": "192.168.0.0/24"
-                }
-            ]
-        },
-        "ens4": {
-            "type": "physical",
-            "ipv4": "10.0.2.16",
-            "netmask": "255.255.255.0",
-            "mac": "52:54:00:12:34:57",
             "routes": [
                 {
                     "default": false,
@@ -39,11 +43,16 @@
                 }
             ]
         },
+        "vxlan200": {
+            "type": "vxlan",
+            "local": "10.0.2.15",
+            "id": 200,
+            "mac_learning": false,
+            "port": 4789
+        },
         "bond0": {
             "type": "bond",
-            "ipv4": "10.0.2.16",
-            "netmask": "255.255.255.0",
-            "mac": "52:54:00:12:34:57",
+            "mac": "52:54:00:12:34:56",
             "dns": ["8.8.8.8", "8.8.4.4"],
             "bond_slaves": ["ens3", "ens4"],
             "bond_mode": "active-backup",
@@ -51,12 +60,7 @@
             "bond_miimon": 100,
             "bond_downdelay": 200,
             "bond_updelay": 100,
-            "routes": [
-                {
-                    "default": false,
-                    "ip_or_range": "192.169.0.0/24"
-                }
-            ]
+            "bond_lacp_rate": "fast"
         }
     },
     "systemd": {
