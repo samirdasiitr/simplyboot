@@ -664,6 +664,37 @@ def generate_netplan_yaml(interfaces):
     vxlans_config = {}
     bonds_config = {}
 
+    def _ipv4_setting(interface_config, interface_obj):
+        mac_address = interface_config.get("mac")
+        if mac_address:
+            interface_obj["macaddress"] = mac_address
+
+        ipv4_address = interface_config.get("ipv4")
+        netmask = interface_config.get("netmask")
+        if ipv4_address and netmask:
+            try:
+                ip_interface = IPv4Interface((ipv4_address, netmask))
+                interface_obj["addresses"].append(str(ip_interface))
+            except Exception as e:
+                print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
+
+        gateway = interface_config.get("gateway")
+        if gateway:
+            interface_obj["routes"].append({"to": "0.0.0.0/0", "via": gateway})
+
+        routes = interface_config.get("routes", [])
+        for route in routes:
+            to = route.get("ip_or_range")
+            is_default = route.get("default", False)
+
+            if to and not is_default:
+                route_entry = {"to": to}
+                interface_obj["routes"].append(route_entry)
+
+        dns_servers = interface_config.get("dns", [])
+        if dns_servers:
+            interface_obj["nameservers"]["addresses"] = dns_servers
+
     for interface_name, interface_config in interfaces.items():
         if interface_config["type"] == "physical":
             ethernet_config = {
@@ -672,36 +703,7 @@ def generate_netplan_yaml(interfaces):
                 "routes": [],
                 "nameservers": {}
             }
-            mac_address = interface_config.get("mac")
-            if mac_address:
-                ethernet_config["macaddress"] = mac_address
-
-            ipv4_address = interface_config.get("ipv4")
-            netmask = interface_config.get("netmask")
-            if ipv4_address and netmask:
-                try:
-                    ip_interface = IPv4Interface(f"{ipv4_address}/{netmask_to_cidr(netmask)}")
-                    ethernet_config["addresses"].append(str(ip_interface))
-                except Exception as e:
-                    print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
-
-            gateway = interface_config.get("gateway")
-            if gateway:
-                ethernet_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
-
-            routes = interface_config.get("routes", [])
-            for route in routes:
-                to = route.get("ip_or_range")
-                is_default = route.get("default", False)
-
-                if to and not is_default:
-                    route_entry = {"to": to}
-                    ethernet_config["routes"].append(route_entry)
-            
-            dns_servers = interface_config.get("dns", [])
-            if dns_servers:
-                ethernet_config["nameservers"]["addresses"] = dns_servers
-
+            _ipv4_setting(interface_config, ethernet_config)
             ethernets_config[interface_name] = ethernet_config
 
         elif interface_config["type"] == "vlan":
@@ -714,9 +716,11 @@ def generate_netplan_yaml(interfaces):
         elif interface_config["type"] == "bridge":
             bridge_config = {
                 "interfaces": [interface_config["upstream"]],
-                "macaddress": interface_config.get("mac")
+                "macaddress": interface_config.get("mac"),
+                "addresses": [],
+                "routes": []
             }
-            # TODO: add ipv4 details
+            _ipv4_setting(interface_config, bridge_config)
             bridges_config[interface_name] = bridge_config
         
         elif interface_config["type"] == "vxlan":
@@ -748,36 +752,8 @@ def generate_netplan_yaml(interfaces):
                 "routes": [],
                 "nameservers": {}
             }
-            mac_address = interface_config.get("mac")
-            if mac_address:
-                bond_config["macaddress"] = mac_address
 
-            ipv4_address = interface_config.get("ipv4")
-            netmask = interface_config.get("netmask")
-            if ipv4_address and netmask:
-                try:
-                    ip_interface = IPv4Interface(f"{ipv4_address}/{netmask_to_cidr(netmask)}")
-                    bond_config["addresses"].append(str(ip_interface))
-                except Exception as e:
-                    print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
-
-            gateway = interface_config.get("gateway")
-            if gateway:
-                bond_config["routes"].append({"to": "0.0.0.0/0", "via": gateway})
-
-            routes = interface_config.get("routes", [])
-            for route in routes:
-                to = route.get("ip_or_range")
-                is_default = route.get("default", False)
-
-                if to and not is_default:
-                    route_entry = {"to": to}
-                    bond_config["routes"].append(route_entry)
-
-            dns_servers = interface_config.get("dns", [])
-            if dns_servers:
-                bond_config["nameservers"]["addresses"] = dns_servers
-
+            _ipv4_setting(interface_config, bond_config)
             bonds_config[interface_name] = bond_config
 
     if ethernets_config:
@@ -831,6 +807,8 @@ def generate_ifupdown_interfaces(interfaces):
               the string content for each interface's configuration file.
     """
     ifupdown_configs = {}
+
+    # TODO: update the logic and test.
 
     for interface_name, interface_config in interfaces.items():
         # ifupdown is less suited for complex setups like VXLANs and advanced bonds

@@ -1,4 +1,6 @@
 #!/bin/bash
+
+set -ex
 # init.sh - Custom init script for Buildroot initrd
 # This script is the first process (PID 1) executed by the kernel within the initramfs.
 # It performs essential system setup, mounts necessary filesystems, loads kernel modules,
@@ -55,6 +57,8 @@ load_kernel_modules() {
     modprobe nvme || echo "Warning: nvme module not found or failed to load."
     modprobe nvme_core || echo "Warning: nvme_core module not found or failed to load."
     modprobe nvme_pci || echo "Warning: nvme_pci module not found or failed to load."
+
+    modprobe nbd || echo "Warning: nbd module not found or failed to load"
 
     modprobe raid1
 

@@ -5,7 +5,8 @@
     "initrd": "/boot/initrd.img-6.11.0-26-generic",
     "image": {
         "rsync_server": "192.168.122.1",
-        "name": "default-image"
+        "name": "default-image",
+        "type": "rsync"
     },
     "kernel_arguments": "rw console=tty0 console=ttyS0,115200n8 rw crash=auto",
     "provisioning_status": "sync",
@@ -80,5 +81,6 @@
             "groups": ["sudo", "users"],
             "ssh_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSjJRlKjFqsI2rvwALVeszFZodLSF8/m1Sg2iHRzZfIAFegQ0XAk9gpXJoiyK7BpJxB7ySGcwdLzDugbDl+RKcU9tO3PEIcyWoQ8S5nxnAWGZvsbqtKHCRrO27vNHrpbQdvDy2"
         }
-    }
+    },
+    "boot_commands": []
 }
