@@ -240,6 +240,11 @@ sudo chmod +x init || error_exit "Failed to set executable permission on /init"
 echo "Copying kernel modules"
 mkdir -p ./lib/modules/
 cp -fr $SOURCE_MODULES ./lib/modules/
+rm -fr ./lib/modules/6.11.0-26-generic/kernel/drivers/media
+rm -fr ./lib/modules/6.11.0-26-generic/kernel/drivers/gpu
+rm -fr ./lib/modules/6.11.0-26-generic/kernel/drivers/iio
+rm -fr ./lib/modules/6.11.0-26-generic/kernel/sound
+
 
 # 10. Copy modules
 echo "Copying ignition to target"
@@ -254,6 +259,9 @@ sudo chmod 755 -R dev || error_exit "Failed to set permissions on dev"
 
 # 12. Copy init.py
 cp ../init.py ./init.py
+cp ../provisioner ./provisioner
+
+rm -fr usr/lib/python3/dist-packages/ansible_collections*
 
 # 13. Package: Create the initrd.img archive
 echo "Creating cpio archive: $OUTPUT_FILE"

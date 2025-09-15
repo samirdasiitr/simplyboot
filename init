@@ -57,6 +57,7 @@ load_kernel_modules() {
     modprobe nvme || echo "Warning: nvme module not found or failed to load."
     modprobe nvme_core || echo "Warning: nvme_core module not found or failed to load."
     modprobe nvme_pci || echo "Warning: nvme_pci module not found or failed to load."
+    modprobe e1000e || echo "Warning: e1000 module not found or failed to load."
 
     modprobe nbd || echo "Warning: nbd module not found or failed to load"
 
@@ -94,3 +95,4 @@ load_kernel_modules
 create_dev_nodes || exec bash # If device node creation fails, drop to shell.
 
 /usr/bin/python3 /init.py
+#/provisioner

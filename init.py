@@ -28,7 +28,7 @@ IgnitionConfig = None
 
 # Node config
 NodeConfig = None
-
+    
 class AttrDict:
     """
     A class that allows dictionary keys to be accessed as object attributes.
@@ -173,22 +173,42 @@ def create_dev_nodes():
         print(f"failed to mount /dev/ {exc}")
     run_command("/bin/mdev -s")
 
-def read_ignition_file(ignition_dest_path=IGNITION_FILE):
+def read_rsync_port():
+    """
+    Reads rsync port from command line
+    """
+    kernel_args = read_proc_cmdline()
+    rsync_server = kernel_args["rsyncserver"]
+    return rsync_server
+
+def read_ignition_file(ref, ignition_dest_path=IGNITION_FILE):
     """
     Reads ignition.json and loads as json
     """
     global IgnitionConfig
-    try:
-        with open(ignition_dest_path, 'r') as f:
-            IgnitionConfig = AttrDict(json.load(f))
-            print(IgnitionConfig)
-    except FileNotFoundError:
-        print(f"Error: {ignition_dest_path} not found after Ignition run.", file=os.sys.stderr)
-        return False
-    except json.JSONDecodeError as e:
-        print(f"Error: Failed to parse JSON from {ignition_dest_path}: {e}", file=os.sys.stderr)
-        return False
+    kernel_args = read_proc_cmdline()
+    node_config_server = kernel_args["nodeconfigserver"]
+    node_config_server_port = kernel_args["nodeconfigserverport"]
+    for retry in range(0, 5):
+        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/disklayouts/{ref}")
+        response.raise_for_status()
+        if 'application/json' in response.headers.get('Content-Type', ''):
+            IgnitionConfig = AttrDict(response.json())
     return True
+
+def read_software_image(ref):
+    """
+    Reads ignition.json and loads as json
+    """
+    kernel_args = read_proc_cmdline()
+    node_config_server = kernel_args["nodeconfigserver"]
+    node_config_server_port = kernel_args["nodeconfigserverport"]
+    for retry in range(0, 5):
+        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/softwareimages/{ref}")
+        response.raise_for_status()
+        if 'application/json' in response.headers.get('Content-Type', ''):
+            return response.json()
+    return None
 
 def kexec_boot(bootstrap_path):
     """
@@ -497,7 +517,7 @@ def generate_bootstrapped_file():
     else:
         print("Warning: Could not determine root UUID for kexec command line.", file=os.sys.stderr)
 
-    kexec_cmdline = NodeConfig["kernel_arguments"]
+    kexec_cmdline = NodeConfig.get("kernelArgument", "")
     
     if "md" in root_fs.device:
         raid_uuid = get_raid_uuid(root_fs.device)
@@ -573,10 +593,12 @@ def read_node_configuration():
     node_config_server = kernel_args["nodeconfigserver"]
     node_config_server_port = kernel_args["nodeconfigserverport"]
     mac = get_mac_address_for_ip(get_my_ip())
+    translated_mac = mac.replace(":", "_")
     for retry in range(0, 5):
-        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/nodes/{mac}.json")
+        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/nodes/{translated_mac}")
         response.raise_for_status()
         if 'application/json' in response.headers.get('Content-Type', ''):
+            # data is {"hardware": {}, "ignition": {}}
             return response.json()
     return None
 
@@ -1020,11 +1042,11 @@ def process_systemd_service():
     """
     cmds = []
     if "systemd" in NodeConfig:
-        if "enable" in NodeConfig["systemd"]:
-            for service in NodeConfig["systemd"]["enable"]:
+        if "enable" in NodeConfig.get("systemd", ""):
+            for service in NodeConfig["systemd"].get("enable",[]):
                 cmds.append(f"systemctl enable {service}")
-        if "disable" in NodeConfig["systemd"]:
-            for service in NodeConfig["systemd"]["disable"]:
+        if "disable" in NodeConfig.get("systemd", ""):
+            for service in NodeConfig["systemd"].get("disable", []):
                 cmds.append(f"systemctl disable {service}")
     
     if cmds: # Only run if there are commands to execute
@@ -1044,7 +1066,7 @@ def create_or_update_users():
         
     cmds = []
     try:
-        if "users" not in NodeConfig or not NodeConfig["users"]:
+        if not NodeConfig.get("users", False):
             print("No user configurations found in NodeConfig.")
             return
 
@@ -1148,7 +1170,8 @@ def main():
         print("Failed to read node configuration from nodeconfigserver")
         os.execv("/bin/bash", ["bash"])
 
-    if not read_ignition_file():
+    diskLayoutRef = NodeConfig.get("diskLayoutRef", "")
+    if not diskLayoutRef or not read_ignition_file(diskLayoutRef):
         print("Critical Error: failed to read ignition file", file=os.sys.stderr)
         return
 
@@ -1156,43 +1179,54 @@ def main():
     assemble_raid(root_fs)
 
     # Device exists?
-    print(f"Checking if {root_fs.device} exists")
-    if not os.path.exists(root_fs.device):
+    if NodeConfig.get("provisionMode","") == "full":
         if not provision_storage():
             os.execv("/bin/bash", ["bash"])
+    else:
+        print(f"Checking if {root_fs.device} exists")
+        if not os.path.exists(root_fs.device):
+            if not provision_storage():
+                os.execv("/bin/bash", ["bash"])
 
-    # Filesystem created?
-    print(f"Checking if FS exists on {root_fs.device}")
-    if not get_filesystem_type(root_fs.device):
-        if not provision_storage():
-            os.execv("/bin/bash", ["bash"])
+        # Filesystem created?
+        print(f"Checking if FS exists on {root_fs.device}")
+        if not get_filesystem_type(root_fs.device):
+            if not provision_storage():
+                os.execv("/bin/bash", ["bash"])
 
     print(f"Mounting {root_fs.device} at {SYSROOT} as {root_fs.format}")
     run_command(f"mount -t {root_fs.format} {root_fs.device} {SYSROOT}")
 
-    rsync_server = NodeConfig["image"]["rsync_server"]
-    image_name = NodeConfig["image"]["name"]
-    rsync_url = f"rsync://{rsync_server}/images/{image_name}/*"
+    rsync_server = read_rsync_port()
+    image_name = NodeConfig.get("softwareImageRef", "")
+    if not image_name:
+        print("Critical Error: softwareImageRef not defined")
+        return
+
+    rsync_url = f"rsync://{rsync_server}:8730/images/{image_name}/*"
+    print(f"rsync config: {rsync_url}")
 
     # If rootfs was not copied properly
     if not os.path.exists(path_join("/sysroot/", FS_INSTALLED_MARKER)):
         if not transfer_rootfs(source=rsync_url):
             os.execv("/bin/bash", ["bash"])
     
-    if NodeConfig["provisioning_status"] == "sync":
+    if NodeConfig.get("provisionMode","") == "sync":
         transfer_rootfs(source=rsync_url)
     
     print("Copying kernel and initrd to tmp...")
-    shutil.copyfile(path_join("/sysroot", NodeConfig["kernel"]), "/tmp/vmlinuz")
-    shutil.copyfile(path_join("/sysroot", NodeConfig["initrd"]), "/tmp/initrd.img")
+    imageInfo = read_software_image(image_name+".json")
+    shutil.copyfile(path_join("/sysroot", imageInfo["kernel"]), "/tmp/vmlinuz")
+    shutil.copyfile(path_join("/sysroot", imageInfo["initrd"]), "/tmp/initrd.img")
 
     if not os.path.exists(path_join("/sysroot/", BOOTSTRAPPED_MARKER)):
         # Create boostrapped file
         generate_bootstrapped_file()
     
+    print("Comparing timestamp...")
     compare_ret = compare_file_mtime_with_unix_timestamp(
         path_join("/sysroot/", BOOTSTRAPPED_MARKER), 
-        NodeConfig["config_timestamp"])
+        NodeConfig["configTimestamp"])
     if compare_ret == -2:
         print("failed to compare config timestamp")
     
@@ -1201,6 +1235,7 @@ def main():
         generate_bootstrapped_file()
 
     try:
+        print(f"Setting hostname to {NodeConfig['name']}...")
         filename = path_join("/sysroot", "/etc/hostname")
         print(f"Updating {filename}")
         with open(filename, "w") as outf:
@@ -1215,11 +1250,12 @@ def main():
         #             outf.write(f"nameserver {ds}\n")
 
         # Root SSH key management
+        print(f"Injecting ssh key...")
         os.makedirs(path_join("/sysroot", "root/.ssh/"), exist_ok=True)
         filename = path_join("/sysroot", "root/.ssh/authorized_keys")
         print(f"Updating {filename}")
         with open(filename, "w") as outf: # Overwrite for root's authorized_keys
-            ssh_key = NodeConfig.get("ssh_key", "") # Use .get with default empty string
+            ssh_key = NodeConfig.get("sshKey", "") # Use .get with default empty string
             if ssh_key:
                 outf.write(f"{ssh_key}\n")
             else:
@@ -1231,10 +1267,11 @@ def main():
         os.execv("/bin/bash", ["bash"])
 
     try:
+        print(f"Configuing netplan...")
         remove_netplan_files()
 
         # Generate netplan or ifupdown based on os_type
-        if NodeConfig.get("os_type") == "dgx": # Using .get for robustness
+        if NodeConfig.get("osType") == "dgx": # Using .get for robustness
             ifdata = generate_ifupdown_interfaces(NodeConfig["interfaces"])
             save_config_files("ifupdown", ifdata, path_join(SYSROOT, "etc/network/interfaces.d"))
             print(f"Wrote ifupdown configurations.")
@@ -1256,6 +1293,7 @@ def main():
     try:
         run_command("sync")
         run_command("umount /sysroot")
+        run_command("cat /tmp/kexec.sh")
     except subprocess.CalledProcessError as exc:
         print(f"Failed to sync sysroot {exc}")
 
@@ -1270,5 +1308,8 @@ def main():
     os.execv("/bin/bash", ["bash"]) # Fallback to an emergency shell if all else fails
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(exc)
     os.execv("/bin/bash", ["bash"]) # Ensure dropping to shell if main fails
