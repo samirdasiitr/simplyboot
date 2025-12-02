@@ -233,6 +233,8 @@ echo "Creating /init script..."
 # This is the script that the kernel will execute as PID 1
 cp ../init ./init
 chmod +x ./init
+cp ../syslogclient ./syslogclient 
+chmod +x ./syslogclient 
 
 sudo chmod +x init || error_exit "Failed to set executable permission on /init"
 

@@ -18,4 +18,4 @@ lock file = ./rsyncd.lock
   exclude from = ./rsync-exclude.list
 EOF
 
-rsync --daemon --config rsyncd.conf --address 192.168.122.1
+rsync --daemon --config rsyncd.conf --address 192.168.122.1 --port 8730

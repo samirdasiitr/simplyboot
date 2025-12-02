@@ -28,6 +28,48 @@ IgnitionConfig = None
 
 # Node config
 NodeConfig = None
+
+def PRINT(*args, **kwargs):
+    # Match print API
+    sep = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    file = kwargs.get("file", None)
+    flush = kwargs.get("flush", False)
+
+    # Compose message like print() would
+    msg = sep.join(str(a) for a in args) + end
+
+    # Read kernel cmdline directly to avoid recursion if read_proc_cmdline() uses PRINT()
+    kernel_args = read_proc_cmdline()
+    host = kernel_args["syslogserver"]
+    port = kernel_args["syslogserverport"]
+
+    # Try remote logging if available
+    try:
+        if host and shutil.which("/syslogclient"):
+            # Send without double newline to remote
+            remote_msg = msg if not msg.endswith("\n") else msg[:-1]
+            subprocess.run(
+                [
+                    "/syslogclient",
+                    "--remote-ip", str(host),
+                    "--remote-port", str(port),
+                    "--msg", remote_msg,
+                ],
+                check=False,
+            )
+    except Exception:
+        # Ignore remote logging failures; always print locally too
+        pass
+
+    # Always print locally with exact print() semantics
+    try:
+        # Get the real builtin print (handles when __builtins__ is module or dict)
+        builtins_print = __builtins__['print'] if isinstance(__builtins__, dict) else __builtins__.print
+        builtins_print(*args, sep=sep, end=end, file=file, flush=flush)
+    except Exception:
+        # Last-resort fallback
+        print(*args, sep=sep, end=end, file=file, flush=flush)
     
 class AttrDict:
     """
@@ -91,9 +133,9 @@ def _create_marker_file(marker_name, sysroot_mounted=True):
     try:
         with open(marker_path, 'w') as f:
             f.write(f"Stage '{marker_name}' completed successfully at {time.ctime()} (PID {os.getpid()})\n")
-        print(f"Marker file created: {marker_path}")
+        PRINT(f"Marker file created: {marker_path}")
     except IOError as e:
-        print(f"Warning: Could not create marker file {marker_path}: {e}", file=os.sys.stderr)
+        PRINT(f"Warning: Could not create marker file {marker_path}: {e}", file=os.sys.stderr)
 
 # --- Functions ---
 
@@ -119,9 +161,9 @@ def run_command(command, check_success=True, shell=True, capture_output=False, s
             result = subprocess.run(command, shell=shell, check=check_success)
         return result
     except subprocess.CalledProcessError as e:
-        print(f"Error: Command failed: {e.cmd}", file=os.sys.stderr)
+        PRINT(f"Error: Command failed: {e.cmd}", file=os.sys.stderr)
         if capture_output:
-            print(f"Output: {e.stdout}", file=os.sys.stderr) # stdout contains stderr if stderr_to_stdout
+            PRINT(f"Output: {e.stdout}", file=os.sys.stderr) # stdout contains stderr if stderr_to_stdout
         if check_success:
             raise
         return None
@@ -131,13 +173,13 @@ def setup_initial_filesystems():
     Mounts essential pseudo-filesystems required by the kernel and user space.
     These include /proc for process information and /sys for device information.
     """
-    print("Mounting /proc and /sys...")
+    PRINT("Mounting /proc and /sys...")
     try:
         run_command("mount -t proc none /proc")
         run_command("mount -t sysfs none /sys")
         return True
     except Exception as e:
-        print(f"Error: Failed to mount initial filesystems: {e}", file=os.sys.stderr)
+        PRINT(f"Error: Failed to mount initial filesystems: {e}", file=os.sys.stderr)
         return False
 
 def load_kernel_modules():
@@ -145,7 +187,7 @@ def load_kernel_modules():
     Loads necessary kernel modules for hardware detection and functionality.
     Modules are crucial for storage, network, and input devices.
     """
-    print("Loading essential kernel modules...")
+    PRINT("Loading essential kernel modules...")
     modules = [
         "usbhid", "ehci-hcd", "xhci-hcd",
         "virtio", "virtio_pci", "virtio_blk", "virtio_net", "virtio_scsi", "virtio_ring",
@@ -156,7 +198,7 @@ def load_kernel_modules():
         try:
             run_command(f"modprobe {module}", check_success=False)
         except Exception:
-            print(f"Warning: {module} module not found or failed to load.", file=os.sys.stderr)
+            PRINT(f"Warning: {module} module not found or failed to load.", file=os.sys.stderr)
     run_command("lsmod")
     return True
 
@@ -166,11 +208,11 @@ def create_dev_nodes():
     simple udev replacement. This is essential for the system to interact
     with hardware devices.
     """
-    print("Creating /dev entries with mdev...")
+    PRINT("Creating /dev entries with mdev...")
     try:
         run_command("mount -t devtmpfs devtmpfs /dev")
     except Exception as exc:
-        print(f"failed to mount /dev/ {exc}")
+        PRINT(f"failed to mount /dev/ {exc}")
     run_command("/bin/mdev -s")
 
 def read_rsync_port():
@@ -179,7 +221,8 @@ def read_rsync_port():
     """
     kernel_args = read_proc_cmdline()
     rsync_server = kernel_args["rsyncserver"]
-    return rsync_server
+    rsync_server_port = kernel_args["rsyncserverport"]
+    return rsync_server, rsync_server_port
 
 def read_ignition_file(ref, ignition_dest_path=IGNITION_FILE):
     """
@@ -189,12 +232,40 @@ def read_ignition_file(ref, ignition_dest_path=IGNITION_FILE):
     kernel_args = read_proc_cmdline()
     node_config_server = kernel_args["nodeconfigserver"]
     node_config_server_port = kernel_args["nodeconfigserverport"]
+
+    for retry in range(5):
+            try:
+                response = requests.get(
+                    f"http://{node_config_server}:{node_config_server_port}/disklayouts/{ref}",
+                    timeout=5
+                )
+                response.raise_for_status()
+                if 'application/json' in response.headers.get('Content-Type', ''):
+                    with open(ignition_dest_path, "w") as outf:
+                        IgnitionConfig = AttrDict(response.json())
+                        json.dump(response.json(), outf, indent=2)
+                    return True
+            except requests.RequestException as e:
+                PRINT(f"Attempt {retry + 1} failed: {e}")
+        
+    return False
+
+def download_byohagent():
+    """
+    Download byohagent
+    """
+    kernel_args = read_proc_cmdline()
+    node_config_server = kernel_args["nodeconfigserver"]
+    node_config_server_port = kernel_args["nodeconfigserverport"]
     for retry in range(0, 5):
-        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/disklayouts/{ref}")
+        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/byohagent")
         response.raise_for_status()
-        if 'application/json' in response.headers.get('Content-Type', ''):
-            IgnitionConfig = AttrDict(response.json())
-    return True
+        if 'application/octet-stream' in response.headers.get('Content-Type', ''):
+            # save to a file in /tmp
+            with open("/tmp/byohagent.tar", "wb") as f:
+                f.write(response.content)
+            return "/tmp/byohagent.tar", True
+    return "", False
 
 def read_software_image(ref):
     """
@@ -221,18 +292,18 @@ def kexec_boot(bootstrap_path):
         bool: False if kexec fails (script will continue), does not return if successful.
     """
     if not bootstrap_path:
-        print("Error: No bootstrap path provided to kexec_boot.", file=os.sys.stderr)
+        PRINT("Error: No bootstrap path provided to kexec_boot.", file=os.sys.stderr)
         return False
-    print(f"Booting from {bootstrap_path} using kexec...")
+    PRINT(f"Booting from {bootstrap_path} using kexec...")
     try:
         # The execve call replaces the current process, so this function won't return
         # if kexec is successful.
         os.execv(bootstrap_path, [bootstrap_path])
         # If execv fails, the following line will be reached.
-        print(f"Error: kexec command failed to execute {bootstrap_path}. Check kexec logs.", file=os.sys.stderr)
+        PRINT(f"Error: kexec command failed to execute {bootstrap_path}. Check kexec logs.", file=os.sys.stderr)
         return False # Indicate failure if exec returns
     except OSError as e:
-        print(f"Error during kexec_boot: {e}", file=os.sys.stderr)
+        PRINT(f"Error during kexec_boot: {e}", file=os.sys.stderr)
         return False
 
 def write_kexec_command(kernel_path, initramfs_path, kernel_cmdline):
@@ -249,24 +320,24 @@ def write_kexec_command(kernel_path, initramfs_path, kernel_cmdline):
         bool: True on success, False on error.
     """
     target_file = os.path.join("/sysroot", BOOTSTRAPPED_MARKER)
-    print(f"Attempting to write kexec command to {target_file}...")
+    PRINT(f"Attempting to write kexec command to {target_file}...")
 
     if not all([kernel_path, initramfs_path, kernel_cmdline]):
-        print("Error: All three arguments (kernel_path, initramfs_path, kernel_cmdline) are required.", file=os.sys.stderr)
-        print("Usage: write_kexec_command <kernel_path> <initramfs_path> \"<kernel_cmdline>\"", file=os.sys.stderr)
+        PRINT("Error: All three arguments (kernel_path, initramfs_path, kernel_cmdline) are required.", file=os.sys.stderr)
+        PRINT("Usage: write_kexec_command <kernel_path> <initramfs_path> \"<kernel_cmdline>\"", file=os.sys.stderr)
         return False
 
     if not os.path.isfile(kernel_path):
-        print(f"Error: Kernel image not found at {kernel_path}.", file=os.sys.stderr)
+        PRINT(f"Error: Kernel image not found at {kernel_path}.", file=os.sys.stderr)
         return False
 
     if not os.path.isfile(initramfs_path):
-        print(f"Error: Initramfs image not found at {initramfs_path}.", file=os.sys.stderr)
+        PRINT(f"Error: Initramfs image not found at {initramfs_path}.", file=os.sys.stderr)
         return False
 
     if not os.path.isdir("/sysroot"):
-        print("Error: The /sysroot directory does not exist or is not a directory.", file=os.sys.stderr)
-        print("This function assumes a chroot or similar environment where /sysroot is the target root.", file=os.sys.stderr)
+        PRINT("Error: The /sysroot directory does not exist or is not a directory.", file=os.sys.stderr)
+        PRINT("This function assumes a chroot or similar environment where /sysroot is the target root.", file=os.sys.stderr)
         return False
 
     kexec_cmd = f'kexec -l "{kernel_path}" --initrd="{initramfs_path}" --append="{kernel_cmdline}"'
@@ -277,27 +348,27 @@ def write_kexec_command(kernel_path, initramfs_path, kernel_cmdline):
             f.write(f"{kexec_cmd}\n")
             f.write("kexec -e\n")
         os.chmod(target_file, 0o755)
-        print(f"Successfully wrote kexec command to {target_file}.")
-        print(f"Command written: {kexec_cmd}")
-        print(f"Permissions set to 644 for {target_file}.")
+        PRINT(f"Successfully wrote kexec command to {target_file}.")
+        PRINT(f"Command written: {kexec_cmd}")
+        PRINT(f"Permissions set to 644 for {target_file}.")
         return True
     except IOError as e:
-        print(f"Error: Failed to write kexec command to {target_file}: {e}", file=os.sys.stderr)
-        print("Please ensure sufficient permissions (e.g., run with sudo).", file=os.sys.stderr)
+        PRINT(f"Error: Failed to write kexec command to {target_file}: {e}", file=os.sys.stderr)
+        PRINT("Please ensure sufficient permissions (e.g., run with sudo).", file=os.sys.stderr)
         return False
 
 def get_ignition_root():
     """
     Returns root fs entry from ignition config.
     """
-    print(f"Reading root fs entry from ignition.json")
+    PRINT(f"Reading root fs entry from ignition.json")
     for fs in IgnitionConfig.storage.filesystems:
         if fs.path == "/":
             return fs
     raise Exception("failed to find root filesystem")
 
 def assemble_raid(fs):
-    print(f"Probing for raid in {fs.device}")
+    PRINT(f"Probing for raid in {fs.device}")
     if "md" in fs.device: # Raided device
         for raid in IgnitionConfig.storage.raid:
             if fs.device.split("/")[-1] in raid.name:
@@ -306,14 +377,14 @@ def assemble_raid(fs):
                     mdstat_detail = mdstat.parse()
                     for raid, raid_detail in mdstat_detail["devices"].items():
                         if raid_detail["active"]:
-                            print(f"Stopping raid /dev/{raid}")
+                            PRINT(f"Stopping raid /dev/{raid}")
                             run_command(f"mdadm --stop /dev/{raid}")
 
-                    print(f"Assembling raid device {fs.device} with {devices}")
+                    PRINT(f"Assembling raid device {fs.device} with {devices}")
                     run_command(f"mdadm --assemble {fs.device} {devices}")
                     return True
                 except subprocess.CalledProcessError as exc:
-                    print(f"Failed to assemble raid, probably raid was not created.")
+                    PRINT(f"Failed to assemble raid, probably raid was not created.")
     return False
 
 def get_filesystem_type(device_path):
@@ -338,20 +409,20 @@ def get_filesystem_type(device_path):
             check=True
         )
         output = result.stdout.strip()
-        print(f"DEBUG: blkid {output}")
+        PRINT(f"DEBUG: blkid {output}")
         
         for line in output.splitlines():
             if line.startswith("TYPE="):
                 # Extract the filesystem type
                 fs_type = line.split('=')[1].strip('"')
-                print(f"Found {fs_type} at {device_path}")
+                PRINT(f"Found {fs_type} at {device_path}")
                 return fs_type
         return None # No FSTYPE found, likely no filesystem
     except subprocess.CalledProcessError:
         # blkid returns non-zero exit code if no filesystem or device not found
         return None
     except FileNotFoundError:
-        print(f"Error: 'blkid' command not found. Please ensure it's installed and in your PATH.")
+        PRINT(f"Error: 'blkid' command not found. Please ensure it's installed and in your PATH.")
         return None
         
 def mount_root():
@@ -377,7 +448,7 @@ def configure_network():
     """
     Attempts to bring up network interfaces and obtain an IP address via DHCP.
     """
-    print("Probing for network interfaces and attempting DHCP...")
+    PRINT("Probing for network interfaces and attempting DHCP...")
     run_command("ls /sys/class/net/", check_success=False) # ls might fail if /sys/class/net is empty
 
     os.makedirs("/var/lib/dhcp/", exist_ok=True)
@@ -394,21 +465,21 @@ def configure_network():
         if if_name == "lo" or not if_name:
             continue
 
-        print(f"Found network interface: {if_name}")
-        print(f"Bringing interface {if_name} up...")
+        PRINT(f"Found network interface: {if_name}")
+        PRINT(f"Bringing interface {if_name} up...")
         run_command(f"ip link set dev {if_name} up")
 
-        print(f"Attempting DHCP on {if_name} for up to 10 seconds...")
+        PRINT(f"Attempting DHCP on {if_name} for up to 10 seconds...")
         try:
             # Using 'dhclient' (common in Buildroot) with a timeout.
             subprocess.run(f"timeout 10 dhclient -v {if_name}", shell=True, check=True)
-            print(f"Successfully obtained IP on {if_name} using dhclient!")
+            PRINT(f"Successfully obtained IP on {if_name} using dhclient!")
             return True # Success
         except subprocess.CalledProcessError:
-            print(f"DHCP failed on {if_name}. Bringing interface down.", file=os.sys.stderr)
+            PRINT(f"DHCP failed on {if_name}. Bringing interface down.", file=os.sys.stderr)
             run_command(f"ip link set dev {if_name} down", check_success=False)
 
-    print("Network probing complete. No network connection could be detected.")
+    PRINT("Network probing complete. No network connection could be detected.")
     return False # Failure
 
 def provision_storage():
@@ -423,19 +494,19 @@ def provision_storage():
     ignition_dest_path = "/run/ignition.json"
 
     if not os.path.isfile(ignition_source_path):
-        print(f"Error: {ignition_source_path} not found. Cannot determine root partition.", file=os.sys.stderr)
+        PRINT(f"Error: {ignition_source_path} not found. Cannot determine root partition.", file=os.sys.stderr)
         return False
     try:
         shutil.copy(ignition_source_path, ignition_dest_path)
     except IOError as e:
-        print(f"Error: Failed to copy {ignition_source_path} to {ignition_dest_path}: {e}", file=os.sys.stderr)
+        PRINT(f"Error: Failed to copy {ignition_source_path} to {ignition_dest_path}: {e}", file=os.sys.stderr)
         return False
 
-    print("Running /usr/bin/ignition to configure disks...")
+    PRINT("Running /usr/bin/ignition to configure disks...")
     try:
         run_command("/usr/bin/ignition -platform file -stage disks")
     except subprocess.CalledProcessError:
-        print("Error: Ignition disk stage failed.", file=os.sys.stderr)
+        PRINT("Error: Ignition disk stage failed.", file=os.sys.stderr)
         return False
     
     return True
@@ -445,14 +516,14 @@ def final_setup():
     Performs final setup tasks before handing control to the main system,
     such as mounting /run as tmpfs and setting the umask.
     """
-    print("Performing final setup steps...")
+    PRINT("Performing final setup steps...")
     try:
         run_command("mount -t tmpfs tmpfs /run -o mode=0755,nodev,nosuid", check_success=False)
     except Exception:
-        print("WARNING: Failed to mount /run as tmpfs.", file=os.sys.stderr)
+        PRINT("WARNING: Failed to mount /run as tmpfs.", file=os.sys.stderr)
 
     os.umask(0o077)
-    print("Umask set to 077.")
+    PRINT("Umask set to 077.")
     return True
 
 def transfer_rootfs(source="rsync://10.10.6.5/images/k8s-worker-dgx-h200-image-060525/*",
@@ -466,22 +537,22 @@ def transfer_rootfs(source="rsync://10.10.6.5/images/k8s-worker-dgx-h200-image-0
 
     retry_count = 0
     while True:
-        print(f"Attempt {retry_count + 1} of {max_retries}...")
+        PRINT(f"Attempt {retry_count + 1} of {max_retries}...")
         try:
             # Use subprocess.run for rsync, as it might be a long-running process
             subprocess.run(f"rsync {rsync_options} {source} {destination}", shell=True, check=True)
-            print("rsync completed successfully.")
+            PRINT("rsync completed successfully.")
             break
         except subprocess.CalledProcessError as e:
-            print(f"rsync failed with exit status: {e.returncode}", file=os.sys.stderr)
+            PRINT(f"rsync failed with exit status: {e.returncode}", file=os.sys.stderr)
             retry_count += 1
 
             if retry_count >= max_retries:
-                print(f"Max retries ({max_retries}) reached. Rsync failed definitively.", file=os.sys.stderr)
+                PRINT(f"Max retries ({max_retries}) reached. Rsync failed definitively.", file=os.sys.stderr)
                 raise # Re-raise the last exception, indicating a critical failure
             
             current_delay = delay
-            print(f"Retrying in {current_delay} seconds...", file=os.sys.stderr)
+            PRINT(f"Retrying in {current_delay} seconds...", file=os.sys.stderr)
             time.sleep(current_delay)
 
     _create_marker_file(FS_INSTALLED_MARKER)
@@ -496,7 +567,7 @@ def get_raid_uuid(device):
         uuid = "-".join(output.stdout.split(":")[1:]).strip()
         return uuid
     except subprocess.CalledProcessError as e:
-        print(f"failed to get raid uuid")
+        PRINT(f"failed to get raid uuid")
     return None
 
 def generate_bootstrapped_file():
@@ -506,18 +577,19 @@ def generate_bootstrapped_file():
     """
     global NodeConfig
 
-    print(f"Generating bootstrapped file")
+    PRINT(f"Generating bootstrapped file")
     root_uuid = ""
     # Extract UUID from the global `IgnitionConfig`
     root_fs = get_ignition_root()
     root_uuid = root_fs.uuid
     
     if root_uuid:
-        print(f"Identified root UUID: {root_uuid}")
+        PRINT(f"Identified root UUID: {root_uuid}")
     else:
-        print("Warning: Could not determine root UUID for kexec command line.", file=os.sys.stderr)
+        PRINT("Warning: Could not determine root UUID for kexec command line.", file=os.sys.stderr)
 
-    kexec_cmdline = NodeConfig.get("kernelArgument", "")
+    kexec_cmdline = NodeConfig.get("kernelArguments", "")
+    PRINT(f"Setting kernel arguments as {kexec_cmdline}")
     
     if "md" in root_fs.device:
         raid_uuid = get_raid_uuid(root_fs.device)
@@ -540,14 +612,14 @@ def generate_bootstrapped_file():
                     break
         
         if root_disk_fallback:
-            print(f"Warning: Using device path ({root_disk_fallback}) for root, consider providing UUID for robustness.", file=os.sys.stderr)
+            PRINT(f"Warning: Using device path ({root_disk_fallback}) for root, consider providing UUID for robustness.", file=os.sys.stderr)
             kexec_cmdline = f"{kexec_cmdline} root={root_disk_fallback}"
         else:
-            print("Critical: Neither UUID nor device path found for root. Kexec command line for root will be incomplete.", file=os.sys.stderr)
+            PRINT("Critical: Neither UUID nor device path found for root. Kexec command line for root will be incomplete.", file=os.sys.stderr)
             return False # Cannot generate a reliable kexec command without root info
 
     if not write_kexec_command("/tmp/vmlinuz", "/tmp/initrd.img", kexec_cmdline):
-        print("Error: Failed to write kexec command.", file=os.sys.stderr)
+        PRINT("Error: Failed to write kexec command.", file=os.sys.stderr)
         return False
     return True
 
@@ -595,7 +667,7 @@ def read_node_configuration():
     mac = get_mac_address_for_ip(get_my_ip())
     translated_mac = mac.replace(":", "_")
     for retry in range(0, 5):
-        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/nodes/{translated_mac}")
+        response = requests.get(f"http://{node_config_server}:{node_config_server_port}/nodes/{translated_mac}.json")
         response.raise_for_status()
         if 'application/json' in response.headers.get('Content-Type', ''):
             # data is {"hardware": {}, "ignition": {}}
@@ -609,12 +681,12 @@ def read_proc_cmdline():
     config = {}
     with open("/proc/cmdline") as inf:
         tokens = inf.read().split()
-        print(tokens)
+        #print(tokens)
         for token in tokens:
             if "=" in token:
                 ents = token.split("=")
                 config[ents[0]] = ents[1]
-    print(config)
+    #print(config)
     return config
 
 def compare_file_mtime_with_unix_timestamp(file_path, unix_timestamp_str):
@@ -631,15 +703,15 @@ def compare_file_mtime_with_unix_timestamp(file_path, unix_timestamp_str):
     try:
         # 1. Get the file's modified timestamp
         file_mtime_unix = os.path.getmtime(file_path)
-        print(f"File '{file_path}' modified Unix timestamp: {file_mtime_unix}")
-        print(f"File '{file_path}' modified datetime: {datetime.datetime.fromtimestamp(file_mtime_unix)}")
+        PRINT(f"File '{file_path}' modified Unix timestamp: {file_mtime_unix}")
+        PRINT(f"File '{file_path}' modified datetime: {datetime.datetime.fromtimestamp(file_mtime_unix)}")
 
 
         # 2. Convert the given Unix timestamp string to an integer
         given_unix_timestamp = int(unix_timestamp_str)
-        print(f"Given Unix timestamp string: {unix_timestamp_str}")
-        print(f"Given Unix timestamp (int): {given_unix_timestamp}")
-        print(f"Given datetime: {datetime.datetime.fromtimestamp(given_unix_timestamp)}")
+        PRINT(f"Given Unix timestamp string: {unix_timestamp_str}")
+        PRINT(f"Given Unix timestamp (int): {given_unix_timestamp}")
+        PRINT(f"Given datetime: {datetime.datetime.fromtimestamp(given_unix_timestamp)}")
 
         # 3. Compare the two values
         if file_mtime_unix > given_unix_timestamp:
@@ -698,7 +770,7 @@ def generate_netplan_yaml(interfaces):
                 ip_interface = IPv4Interface((ipv4_address, netmask))
                 interface_obj["addresses"].append(str(ip_interface))
             except Exception as e:
-                print(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
+                PRINT(f"Warning: Could not parse IP address or netmask for {interface_name}: {e}")
 
         gateway = interface_config.get("gateway")
         if gateway:
@@ -803,9 +875,9 @@ def remove_netplan_files(netplan_dir="/sysroot/etc/netplan/"):
         netplan_dir (str): The directory where Netplan YAML files are located.
                            Defaults to "/etc/netplan/".
     """
-    print(f"Attempting to remove Netplan YAML files from: {netplan_dir}")
+    PRINT(f"Attempting to remove Netplan YAML files from: {netplan_dir}")
     if not os.path.isdir(netplan_dir):
-        print(f"Error: Directory '{netplan_dir}' does not exist.")
+        PRINT(f"Error: Directory '{netplan_dir}' does not exist.")
         return
 
     for filename in os.listdir(netplan_dir):
@@ -813,9 +885,9 @@ def remove_netplan_files(netplan_dir="/sysroot/etc/netplan/"):
             file_path = os.path.join(netplan_dir, filename)
             try:
                 os.remove(file_path)
-                print(f"Successfully removed: {file_path}")
+                PRINT(f"Successfully removed: {file_path}")
             except OSError as e:
-                print(f"Error removing {file_path}: {e}")
+                PRINT(f"Error removing {file_path}: {e}")
 
 def generate_ifupdown_interfaces(interfaces):
     """
@@ -861,7 +933,7 @@ def generate_ifupdown_interfaces(interfaces):
                     config_lines.append(f"    address {ipv4_address}")
                     config_lines.append(f"    netmask {netmask}")
                 except Exception as e:
-                    print(f"Warning (ifupdown): Could not parse IP address or netmask for {interface_name}: {e}")
+                    PRINT(f"Warning (ifupdown): Could not parse IP address or netmask for {interface_name}: {e}")
 
             # Gateway
             gateway = interface_config.get("gateway")
@@ -873,7 +945,7 @@ def generate_ifupdown_interfaces(interfaces):
             # For simplicity, we'll note it here but not add to interfaces.d directly.
             dns_servers = interface_config.get("dns", [])
             if dns_servers:
-                print(f"Note: DNS servers {dns_servers} for {interface_name} would typically go in /etc/resolv.conf with ifupdown setup.")
+                PRINT(f"Note: DNS servers {dns_servers} for {interface_name} would typically go in /etc/resolv.conf with ifupdown setup.")
 
             # Static Routes
             routes = interface_config.get("routes", [])
@@ -932,7 +1004,7 @@ def generate_ifupdown_interfaces(interfaces):
             # DNS for bonds
             dns_servers = interface_config.get("dns", [])
             if dns_servers:
-                print(f"Note: DNS servers {dns_servers} for {interface_name} (bond) would typically go in /etc/resolv.conf with ifupdown setup.")
+                PRINT(f"Note: DNS servers {dns_servers} for {interface_name} (bond) would typically go in /etc/resolv.conf with ifupdown setup.")
 
             routes = interface_config.get("routes", [])
             for route in routes:
@@ -959,7 +1031,7 @@ def generate_ifupdown_interfaces(interfaces):
         elif interface_config["type"] == "vxlan":
             # ifupdown doesn't have native VXLAN support. This would typically require
             # pre-up/post-up scripts to create the VXLAN device using 'ip link add vxlan...'
-            print(f"Warning: VXLAN interface '{interface_name}' requires manual pre-up/post-up scripts for ifupdown.")
+            PRINT(f"Warning: VXLAN interface '{interface_name}' requires manual pre-up/post-up scripts for ifupdown.")
             continue # Skip generating config for VXLAN in ifupdown directly
 
         ifupdown_configs[interface_name] = "\n".join(config_lines) + "\n"
@@ -978,9 +1050,9 @@ def save_config_files(config_type, configs, output_dir):
     if not os.path.exists(output_dir):
         try:
             os.makedirs(output_dir)
-            print(f"Created directory: {output_dir}")
+            PRINT(f"Created directory: {output_dir}")
         except OSError as e:
-            print(f"Error creating directory {output_dir}: {e}. Please ensure you have permissions.")
+            PRINT(f"Error creating directory {output_dir}: {e}. Please ensure you have permissions.")
             return
 
     if config_type == "netplan":
@@ -988,20 +1060,20 @@ def save_config_files(config_type, configs, output_dir):
         try:
             with open(file_path, "w") as f:
                 f.write(configs)
-            print(f"Netplan configuration saved to: {file_path}")
+            PRINT(f"Netplan configuration saved to: {file_path}")
         except IOError as e:
-            print(f"Error writing Netplan file {file_path}: {e}. Please check permissions.")
+            PRINT(f"Error writing Netplan file {file_path}: {e}. Please check permissions.")
     elif config_type == "ifupdown":
         for interface_name, content in configs.items():
             file_path = os.path.join(output_dir, f"{interface_name}.cfg")
             try:
                 with open(file_path, "w") as f:
                     f.write(content)
-                print(f"ifupdown configuration for {interface_name} saved to: {file_path}")
+                PRINT(f"ifupdown configuration for {interface_name} saved to: {file_path}")
             except IOError as e:
-                print(f"Error writing ifupdown file {file_path}: {e}. Please check permissions.")
+                PRINT(f"Error writing ifupdown file {file_path}: {e}. Please check permissions.")
     else:
-        print(f"Unsupported config_type: {config_type}")
+        PRINT(f"Unsupported config_type: {config_type}")
 
 def run_command_in_image(cmds, script_temp_name="temp"):
     """
@@ -1025,7 +1097,7 @@ umount /sysroot/sys
 umount /sysroot/proc
 umount /sysroot/dev
 """
-        print(f"DEBUG: generated script [{chroot_script}]")
+        PRINT(f"DEBUG: generated script [{chroot_script}]")
         script_name = f"/tmp/{script_temp_name}.sh"
         with open(script_name, "w") as outf:
             outf.write(chroot_script)
@@ -1033,7 +1105,7 @@ umount /sysroot/dev
         os.chmod(script_name, 0o755)
         run_command(script_name)
     except subprocess.CalledProcessError as exc:
-        print(f"failed to run {script_name} in target {exc}")
+        PRINT(f"failed to run {script_name} in target {exc}")
         os.execv("/bin/bash", ["bash"])
 
 def process_systemd_service():
@@ -1061,37 +1133,37 @@ def create_or_update_users():
             with open(path_join(SYSROOT, "etc/shadow")) as inf:
                 return inf.read()
         except FileNotFoundError:
-            print("Warning: /etc/shadow not found. Cannot check for existing users.", file=os.sys.stderr)
+            PRINT("Warning: /etc/shadow not found. Cannot check for existing users.", file=os.sys.stderr)
             return "" # Return empty string if file doesn't exist to avoid crash
         
     cmds = []
     try:
         if not NodeConfig.get("users", False):
-            print("No user configurations found in NodeConfig.")
+            PRINT("No user configurations found in NodeConfig.")
             return
 
         for user, detail in NodeConfig["users"].items():
             user_exists = user in _read_etc_shadow()
 
             if user_exists:
-                print(f"User '{user}' already exists. Updating user.")
+                PRINT(f"User '{user}' already exists. Updating user.")
                 # Update groups
                 if "groups" in detail and isinstance(detail["groups"], list):
                     groups_str = ",".join(detail["groups"])
                     cmds.append(["usermod", "-aG", groups_str, user])
-                    print(f"  Groups for '{user}' updated: {groups_str}")
+                    PRINT(f"  Groups for '{user}' updated: {groups_str}")
                 
                 # Update shell
                 if "shell" in detail:
                     cmds.append(["usermod", "-s", detail["shell"], user])
-                    print(f"  Shell for '{user}' updated to {detail['shell']}.")
+                    PRINT(f"  Shell for '{user}' updated to {detail['shell']}.")
                 
                 if "password" in detail:
                     cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
-                    print(f"  Password for '{user}' updated.")
+                    PRINT(f"  Password for '{user}' updated.")
 
             else:
-                print(f"User '{user}' does not exist. Creating new user.")
+                PRINT(f"User '{user}' does not exist. Creating new user.")
                 useradd_cmd = ["useradd", "-m"]
                 if "shell" in detail:
                     useradd_cmd.extend(["-s", detail["shell"]])
@@ -1100,15 +1172,15 @@ def create_or_update_users():
 
                 if "password" in detail:
                     cmds.append([f"echo '{user}:{detail['password']}' | chpasswd"])
-                    print(f"  Password set for '{user}'.")
+                    PRINT(f"  Password set for '{user}'.")
 
                 if "groups" in detail and isinstance(detail["groups"], list):
                     groups_str = ",".join(detail["groups"])
                     cmds.append(["usermod", "-aG", groups_str, user])
-                    print(f"  Groups assigned for '{user}': {groups_str}")
+                    PRINT(f"  Groups assigned for '{user}': {groups_str}")
             
             # Handle SSH key for both new and existing users
-            if "ssh_key" in detail:
+            if "sshKey" in detail:
                 # Ensure .ssh directory exists and has correct permissions within the chroot
                 ssh_dir_path = path_join(f"/home/{user}", ".ssh")
                 authorized_keys_path = path_join(f"/home/{user}", ".ssh/authorized_keys")
@@ -1121,14 +1193,23 @@ def create_or_update_users():
                 # Append the new SSH key. It's safer to always append and let SSH handle duplicates,
                 # or add logic to check for existence before appending if strict uniqueness is needed.
                 # Using 'tee -a' is safer than 'echo >>' for multi-line inputs and permissions.
-                cmds.append([f"echo '{detail['ssh_key']}' | tee -a {authorized_keys_path}"])
+                cmds.append([f"echo '{detail['sshKey']}' | tee -a {authorized_keys_path}"])
                 cmds.append(["chmod", "600", authorized_keys_path])
                 cmds.append(["chown", user, authorized_keys_path])
-                print(f"  SSH key for '{user}' added/appended.")
-
+                PRINT(f"  SSH key for '{user}' added/appended.")
+            
+            if "isSudo" in detail:
+                # Add sudoers entry
+                if "passwordLessSudo" in detail:
+                    # Add passwordless sudo entry
+                    cmds.append([f"echo '{user} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"])
+                    PRINT(f"  Passwordless sudo entry added for '{user}'.")
+                else:
+                    cmds.append([f"echo '{user} ALL=(ALL) ALL' >> /etc/sudoers"])
+                    PRINT(f"  Sudoers entry added for '{user}'.")            
 
     except Exception as exc:
-        print(f"failure in processing user section {exc}")
+        PRINT(f"failure in processing user section {exc}")
         os.execv("/bin/bash", ["bash"])
 
     if cmds:
@@ -1145,20 +1226,38 @@ def path_join(src, dst):
             return path_string
     return os.path.join(src, _helper(dst))
 
+def setup_byoh_service():
+    byohAgentTarFilename, res = download_byohagent()
+    if not res:
+        raise Exception("failed to download byoh agent bundle")
+    
+    PRINT(f"untar {byohAgentTarFilename}")
+    run_command(f"cd /tmp && tar zxvf {byohAgentTarFilename}")
+
+    PRINT("Injecting byohagent at /usr/local/bin/")
+    byohAgentFilename = "/tmp/byoh-hostagent-linux-amd64"
+    run_command(f"cp {byohAgentFilename} /sysroot/usr/local/bin/byoh-hostagent")
+    run_command(f"chmod +x /sysroot/usr/local/bin/byoh-hostagent")
+
+    PRINT(f"Setup byohagent service in target")
+    run_command(f"cp /tmp/byohagent.service /sysroot/etc/systemd/system/byohagent.service")
+    run_command_in_image(["systemctl", "daemon-reload"])
+    run_command_in_image(["systemctl", "enable", "byohagent.service"])
+
 # --- Main Script Execution Flow ---
 def main():
-    print("--- Starting Initramfs Script ---")
+    PRINT("--- Starting Initramfs Script ---")
 
     try:
         os.makedirs("/sysroot")
     except Exception as exc:
-        print(f"WARNING: failed to create /sysroot")
+        PRINT(f"WARNING: failed to create /sysroot")
 
     # Early Initramfs Setup (markers go to initramfs /tmp, not persistent across reboots)
     # This phase ensures basic environment is ready.
-    print("--- Phase 1: Early Initramfs Setup ---")
+    PRINT("--- Phase 1: Early Initramfs Setup ---")
     if not setup_initial_filesystems():
-        print("Critical Error: Initial filesystem setup failed. Dropping to emergency shell.", file=os.sys.stderr)
+        PRINT("Critical Error: Initial filesystem setup failed. Dropping to emergency shell.", file=os.sys.stderr)
 
     load_kernel_modules()
     create_dev_nodes()
@@ -1167,12 +1266,12 @@ def main():
     global NodeConfig
     NodeConfig = read_node_configuration()
     if not NodeConfig:
-        print("Failed to read node configuration from nodeconfigserver")
+        PRINT("Failed to read node configuration from nodeconfigserver")
         os.execv("/bin/bash", ["bash"])
 
     diskLayoutRef = NodeConfig.get("diskLayoutRef", "")
     if not diskLayoutRef or not read_ignition_file(diskLayoutRef):
-        print("Critical Error: failed to read ignition file", file=os.sys.stderr)
+        PRINT("Critical Error: failed to read ignition file", file=os.sys.stderr)
         return
 
     root_fs = get_ignition_root()
@@ -1183,28 +1282,28 @@ def main():
         if not provision_storage():
             os.execv("/bin/bash", ["bash"])
     else:
-        print(f"Checking if {root_fs.device} exists")
+        PRINT(f"Checking if {root_fs.device} exists")
         if not os.path.exists(root_fs.device):
             if not provision_storage():
                 os.execv("/bin/bash", ["bash"])
 
         # Filesystem created?
-        print(f"Checking if FS exists on {root_fs.device}")
+        PRINT(f"Checking if FS exists on {root_fs.device}")
         if not get_filesystem_type(root_fs.device):
             if not provision_storage():
                 os.execv("/bin/bash", ["bash"])
 
-    print(f"Mounting {root_fs.device} at {SYSROOT} as {root_fs.format}")
+    PRINT(f"Mounting {root_fs.device} at {SYSROOT} as {root_fs.format}")
     run_command(f"mount -t {root_fs.format} {root_fs.device} {SYSROOT}")
 
-    rsync_server = read_rsync_port()
+    rsync_server, rsync_server_port = read_rsync_port()
     image_name = NodeConfig.get("softwareImageRef", "")
     if not image_name:
-        print("Critical Error: softwareImageRef not defined")
+        PRINT("Critical Error: softwareImageRef not defined")
         return
 
-    rsync_url = f"rsync://{rsync_server}:8730/images/{image_name}/*"
-    print(f"rsync config: {rsync_url}")
+    rsync_url = f"rsync://{rsync_server}:{rsync_server_port}/images/{image_name}/*"
+    PRINT(f"rsync config: {rsync_url}")
 
     # If rootfs was not copied properly
     if not os.path.exists(path_join("/sysroot/", FS_INSTALLED_MARKER)):
@@ -1214,7 +1313,7 @@ def main():
     if NodeConfig.get("provisionMode","") == "sync":
         transfer_rootfs(source=rsync_url)
     
-    print("Copying kernel and initrd to tmp...")
+    PRINT("Copying kernel and initrd to tmp...")
     imageInfo = read_software_image(image_name+".json")
     shutil.copyfile(path_join("/sysroot", imageInfo["kernel"]), "/tmp/vmlinuz")
     shutil.copyfile(path_join("/sysroot", imageInfo["initrd"]), "/tmp/initrd.img")
@@ -1223,64 +1322,70 @@ def main():
         # Create boostrapped file
         generate_bootstrapped_file()
     
-    print("Comparing timestamp...")
-    compare_ret = compare_file_mtime_with_unix_timestamp(
-        path_join("/sysroot/", BOOTSTRAPPED_MARKER), 
-        NodeConfig["configTimestamp"])
-    if compare_ret == -2:
-        print("failed to compare config timestamp")
-    
-    if compare_ret == -1:
-        print("config_timestamp is more recent, regenerating bootstrapped file")
-        generate_bootstrapped_file()
+#    PRINT("Comparing timestamp...")
+#    compare_ret = compare_file_mtime_with_unix_timestamp(
+#        path_join("/sysroot/", BOOTSTRAPPED_MARKER), 
+#        NodeConfig["configTimestamp"])
+#    if compare_ret == -2:
+#        PRINT("failed to compare config timestamp")
+#    
+#    if compare_ret == -1:
+#        PRINT("config_timestamp is more recent, regenerating bootstrapped file")
+#        generate_bootstrapped_file()
+    generate_bootstrapped_file()
 
     try:
-        print(f"Setting hostname to {NodeConfig['name']}...")
+        PRINT(f"Setting hostname to {NodeConfig['name']}...")
         filename = path_join("/sysroot", "/etc/hostname")
-        print(f"Updating {filename}")
+        PRINT(f"Updating {filename}")
         with open(filename, "w") as outf:
             outf.write(NodeConfig["name"])
 
         # # Update /etc/resolv.conf based on NodeConfig DNS servers if available
         # if "dns_servers" in NodeConfig and NodeConfig["dns_servers"]:
         #     resolv_conf_path = path_join("/sysroot", "etc/resolv.conf")
-        #     print(f"Updating {resolv_conf_path}")
+        #     PRINT(f"Updating {resolv_conf_path}")
         #     with open(resolv_conf_path, "w") as outf:
         #         for ds in NodeConfig["dns_servers"]:
         #             outf.write(f"nameserver {ds}\n")
 
         # Root SSH key management
-        print(f"Injecting ssh key...")
+        PRINT(f"Injecting ssh key...")
         os.makedirs(path_join("/sysroot", "root/.ssh/"), exist_ok=True)
         filename = path_join("/sysroot", "root/.ssh/authorized_keys")
-        print(f"Updating {filename}")
+        PRINT(f"Updating {filename}")
         with open(filename, "w") as outf: # Overwrite for root's authorized_keys
             ssh_key = NodeConfig.get("sshKey", "") # Use .get with default empty string
             if ssh_key:
                 outf.write(f"{ssh_key}\n")
             else:
-                print("Warning: No SSH key found for root in NodeConfig.", file=os.sys.stderr)
+                PRINT("Warning: No SSH key found for root in NodeConfig.", file=os.sys.stderr)
 
-        os.chmod(filename, 0o600)
+        os.chmod(filename, 0o600)        
     except Exception as exc:
-        print(f"Failed to personalize the image {exc}")
+        PRINT(f"Failed to personalize the image {exc}")
         os.execv("/bin/bash", ["bash"])
 
+    if NodeConfig.get("sudoUser", ""):
+        # write an entry for sudo user
+        PRINT(f"Injecting sudo user...")
+        run_command_in_image([f"echo '{NodeConfig['sudoUser']} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"])
+
     try:
-        print(f"Configuing netplan...")
+        PRINT(f"Configuing netplan...")
         remove_netplan_files()
 
         # Generate netplan or ifupdown based on os_type
         if NodeConfig.get("osType") == "dgx": # Using .get for robustness
             ifdata = generate_ifupdown_interfaces(NodeConfig["interfaces"])
             save_config_files("ifupdown", ifdata, path_join(SYSROOT, "etc/network/interfaces.d"))
-            print(f"Wrote ifupdown configurations.")
+            PRINT(f"Wrote ifupdown configurations.")
         else:
             netplan_data = generate_netplan_yaml(NodeConfig["interfaces"])
             save_config_files("netplan", netplan_data, path_join(SYSROOT, "etc/netplan"))        
-            print(f"Wrote netplan configuration.")
+            PRINT(f"Wrote netplan configuration.")
     except Exception as exc:
-        print(f"Failed to generate netplan/ifupdown configuration: {exc}")
+        PRINT(f"Failed to generate netplan/ifupdown configuration: {exc}")
         os.execv("/bin/bash", ["bash"])
 
     shutil.copyfile(path_join("/sysroot", BOOTSTRAPPED_MARKER), "/tmp/kexec.sh")
@@ -1289,27 +1394,29 @@ def main():
     process_systemd_service()
     create_or_update_users()
 
+    #setup_byoh_service()
+
     # Flush the changes
     try:
         run_command("sync")
         run_command("umount /sysroot")
         run_command("cat /tmp/kexec.sh")
     except subprocess.CalledProcessError as exc:
-        print(f"Failed to sync sysroot {exc}")
+        PRINT(f"Failed to sync sysroot {exc}")
 
     #Final boot action
-    print("\n--- Initramfs Script Complete. Handing over control. ---")
+    PRINT("\n--- Initramfs Script Complete. Handing over control. ---")
     try:
         os.execv("/tmp/kexec.sh", ["/tmp/kexec.sh"])
     except OSError as e:
-        print(f"Error executing /tmp/kexec.sh: {e}", file=os.sys.stderr)
+        PRINT(f"Error executing /tmp/kexec.sh: {e}", file=os.sys.stderr)
 
-    print("No kexec command was executed or it failed. Dropping to emergency shell.", file=os.sys.stderr)
+    PRINT("No kexec command was executed or it failed. Dropping to emergency shell.", file=os.sys.stderr)
     os.execv("/bin/bash", ["bash"]) # Fallback to an emergency shell if all else fails
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(exc)
+        PRINT(exc)
     os.execv("/bin/bash", ["bash"]) # Ensure dropping to shell if main fails

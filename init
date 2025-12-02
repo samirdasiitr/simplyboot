@@ -94,5 +94,7 @@ load_kernel_modules
 # Step 3: Create device nodes.
 create_dev_nodes || exec bash # If device node creation fails, drop to shell.
 
-/usr/bin/python3 /init.py
+#/usr/bin/python3 /init.py
 #/provisioner
+
+exec /usr/bin/python3 /init.py
